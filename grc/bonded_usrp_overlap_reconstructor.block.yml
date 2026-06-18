@@ -1,0 +1,68 @@
+id: bonded_usrp_overlap_reconstructor
+label: Overlap Reconstructor
+category: '[bonded_usrp]'
+
+templates:
+  imports: |-
+    from gnuradio import bonded_usrp
+  make: |-
+    bonded_usrp.overlap_reconstructor(${rate_in}, ${rate_out}, ${target_bw}, ${overlap_bw}, ${radio1_offset}, ${radio2_offset}, ${fft_size})
+
+parameters:
+  - id: rate_in
+    label: Per-radio Rate (Hz)
+    dtype: real
+    default: 15e6
+  - id: rate_out
+    label: Combined Rate (Hz)
+    dtype: real
+    default: 20e6
+  - id: target_bw
+    label: Target Bandwidth (Hz)
+    dtype: real
+    default: 20e6
+  - id: overlap_bw
+    label: Overlap Bandwidth (Hz)
+    dtype: real
+    default: 5e6
+  - id: radio1_offset
+    label: Radio1 Offset (Hz)
+    dtype: real
+    default: -5e6
+  - id: radio2_offset
+    label: Radio2 Offset (Hz)
+    dtype: real
+    default: 5e6
+  - id: fft_size
+    label: FFT Size
+    dtype: int
+    default: 4096
+
+inputs:
+  - label: radio1
+    domain: stream
+    dtype: complex
+  - label: radio2
+    domain: stream
+    dtype: complex
+
+outputs:
+  - label: out
+    domain: stream
+    dtype: complex
+
+documentation: |-
+  Overlap-aware wideband reconstruction backed by
+  uhd::usrp::bonded::overlap_reconstructor.
+
+  Two radios each capture a wider slice (per-radio rate / target bandwidth) of a
+  target channel with an intentional overlap of overlap_bw, centered on fc.
+  This block aligns the two slices (gain/phase/delay) using the shared overlap,
+  crossfades the overlap, discards the out-of-band corners, and outputs the
+  contiguous target channel at rate_out.
+
+  Inputs are channel 0 of each bonded B210 (ports 0 and 2 of the Bonded USRP
+  Source). radio1_offset/radio2_offset are each radio's center minus fc (Hz) and
+  must match the freq_plan used to tune the radios.
+
+file_format: 1

@@ -1,0 +1,77 @@
+id: bonded_usrp_bonded_source
+label: Bonded USRP Source
+category: '[bonded_usrp]'
+
+templates:
+  imports: |-
+    from gnuradio import bonded_usrp
+  make: |-
+    bonded_usrp.bonded_source(${serials_csv}, ${rate}, ${freq}, ${gain}, ${clock_source}, ${time_source}, ${strict_lock}, ${lock_timeout}, ${fetch_timeout}, ${subdev}, ${freq_plan_csv})
+
+parameters:
+  - id: serials_csv
+    label: Serials CSV
+    dtype: string
+    default: '30B56D6,30DBC3C'
+  - id: rate
+    label: Rate
+    dtype: real
+    default: 10e6
+  - id: freq
+    label: Frequency
+    dtype: real
+    default: 100e6
+  - id: gain
+    label: Gain (dB)
+    dtype: real
+    default: 40
+  - id: clock_source
+    label: Clock Source
+    dtype: string
+    default: external
+  - id: time_source
+    label: Time Source
+    dtype: string
+    default: external
+  - id: strict_lock
+    label: Strict Lock
+    dtype: bool
+    default: 'False'
+  - id: lock_timeout
+    label: Lock Timeout
+    dtype: real
+    default: 5.0
+  - id: fetch_timeout
+    label: Fetch Timeout
+    dtype: real
+    default: 1.0
+  - id: subdev
+    label: Subdev Spec
+    dtype: string
+    default: ''
+  - id: freq_plan_csv
+    label: Freq Plan CSV
+    dtype: string
+    default: ''
+
+outputs:
+  - label: out0
+    domain: stream
+    dtype: complex
+  - label: out1
+    domain: stream
+    dtype: complex
+  - label: out2
+    domain: stream
+    dtype: complex
+  - label: out3
+    domain: stream
+    dtype: complex
+
+documentation: |-
+  Bonded multi-USRP source backed by uhd::usrp::bonded::bonded_receiver.
+
+  Notes:
+  - Current block exposes 4 output ports (2 devices x 2 channels).
+  - Use channel 0 of each device for the existing WiFi stitched RX flow.
+  - Optional freq_plan_csv sets per-device center frequencies in Hz.

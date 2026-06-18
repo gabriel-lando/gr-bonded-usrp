@@ -1,0 +1,100 @@
+id: bonded_usrp_bonded_sink
+label: Bonded USRP Sink
+category: '[bonded_usrp]'
+
+templates:
+  imports: |-
+    from gnuradio import bonded_usrp
+  make: |-
+    bonded_usrp.bonded_sink(${serials_csv}, ${rate}, ${freq}, ${gain}, ${clock_source}, ${time_source}, ${strict_lock}, ${lock_timeout}, ${subdev}, ${freq_plan_csv}, ${stream_args}, ${delay_trim_a}, ${delay_trim_b}, ${gain_plan_csv}, ${freq_offset_csv}, ${phase_offset_csv})
+
+parameters:
+  - id: serials_csv
+    label: Serials CSV
+    dtype: string
+    default: '30B56D6,30DBC3C'
+  - id: rate
+    label: Per-radio Rate (Hz)
+    dtype: real
+    default: 10e6
+  - id: freq
+    label: Center Frequency (Hz)
+    dtype: real
+    default: 2.412e9
+  - id: gain
+    label: TX Gain (dB)
+    dtype: real
+    default: 0.0
+  - id: clock_source
+    label: Clock Source
+    dtype: string
+    default: external
+  - id: time_source
+    label: Time Source
+    dtype: string
+    default: external
+  - id: strict_lock
+    label: Strict Lock
+    dtype: bool
+    default: 'False'
+  - id: lock_timeout
+    label: Lock Timeout (s)
+    dtype: real
+    default: 5.0
+  - id: subdev
+    label: Subdev Spec
+    dtype: string
+    default: ''
+  - id: freq_plan_csv
+    label: Freq Plan CSV
+    dtype: string
+    default: ''
+  - id: stream_args
+    label: Stream Args
+    dtype: string
+    default: ''
+  - id: delay_trim_a
+    label: Delay Trim A (samples)
+    dtype: int
+    default: 0
+  - id: delay_trim_b
+    label: Delay Trim B (samples)
+    dtype: int
+    default: 0
+  - id: gain_plan_csv
+    label: Gain Plan CSV
+    dtype: string
+    default: ''
+  - id: freq_offset_csv
+    label: Freq Offset CSV (Hz)
+    dtype: string
+    default: ''
+  - id: phase_offset_csv
+    label: Phase Offset CSV (rad)
+    dtype: string
+    default: ''
+
+inputs:
+  - label: radio_a
+    domain: stream
+    dtype: complex
+  - label: radio_b
+    domain: stream
+    dtype: complex
+
+documentation: |-
+  Bonded USRP TX sink backed by uhd::usrp::bonded::bonded_transmitter.
+
+  Accepts two per-radio complex streams (at rate Hz each) and transmits
+  them simultaneously through two synchronized B210s.  The devices share an
+  external 10 MHz reference + PPS so their TX streams are sample-aligned.
+
+  serials_csv: comma-separated B210 serials (radio A first, radio B second).
+  freq_plan_csv: optional per-device center frequencies (Hz), comma-separated;
+    leave empty to auto-compute from freq ± rate/2.
+  delay_trim_a/b: integer per-device sample-delay trim to correct residual
+    inter-device skew (positive = delay that radio's TX start by N samples).
+
+  Typical chain: wifi_phy_hier → band_splitter → bonded_sink.
+
+file_format: 1
