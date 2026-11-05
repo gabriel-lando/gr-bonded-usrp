@@ -16,26 +16,21 @@ namespace bonded {
 /*!
  * Overlap-aware wideband reconstruction for two bonded radios.
  *
- * Two radios each capture a wider slice of a target channel with an
- * intentional spectral overlap (instead of a hard split):
+ * Two radios each capture a slice of a target channel, with an intentional
+ * spectral overlap around the channel centre fc instead of a hard split:
  *
- *   target: a channel of width target_bw centered at fc
- *   radio1: tuned at fc + radio1_offset_hz, captures per_radio_bw
- *   radio2: tuned at fc + radio2_offset_hz, captures per_radio_bw
+ *   target: a channel of width target_bw centered at fc, sampled at target_rate
+ *   radio1: tuned at fc + radio1_offset_hz (lower slice), at per_radio_rate
+ *   radio2: tuned at fc + radio2_offset_hz (upper slice), at per_radio_rate
  *
- * The shared overlap (width overlap_bw, centered on fc) is used to align the
- * two radios (relative gain, phase and fractional delay) and to crossfade the
- * two complex spectra.  The out-of-band corners are discarded.  The result is a
- * single contiguous complex baseband at target_rate.
- *
- * Pipeline (all complex / phase preserving — suitable for decoding):
- *   1. rational-resample each radio per_radio_rate -> target_rate
- *   2. per FFT frame: translate each radio to the target baseband by an integer
- *      bin shift, estimate/apply the radio2->radio1 alignment over the overlap,
- *      crossfade the overlap, discard corners, IFFT (overlap-save).
- *
- * The class is pure C++ (self-contained FFT, no GNU Radio / FFTW dependency) so
- * it can be unit-tested under ctest and wrapped by a GNU Radio block.
+ * Each radio is resampled to target_rate, translated to the target baseband
+ * and band-shaped by complementary complex cos^2/sin^2 crossfade filters whose
+ * transition is the overlap; the out-of-band corners are discarded. Radio 2 is
+ * aligned to radio 1 (gain as a power ratio, phase from the cross-correlation)
+ * over the overlap during a warmup, after which the alignment is frozen (the
+ * radios share a 10 MHz reference, so it is static) and a fused path runs one
+ * complex polyphase filter per radio. The result is one contiguous,
+ * phase-preserving complex baseband suitable for decoding.
  */
 
 struct overlap_reconstructor_config
@@ -46,17 +41,17 @@ struct overlap_reconstructor_config
     double overlap_bw       = 5e6;   //!< Shared overlap bandwidth (Hz)
     double radio1_offset_hz = -5e6;  //!< radio1 center - fc (Hz), lower slice
     double radio2_offset_hz = +5e6;  //!< radio2 center - fc (Hz), upper slice
-    size_t fft_size         = 4096;  //!< FFT size (power of two, multiple of 4)
-    bool estimate_alignment = true;  //!< Estimate gain/phase/delay from overlap
+    //! Output samples to process before freezing the (static) alignment and
+    //! switching to the fused steady-state path.
+    size_t warmup_samples = 200000;
 };
 
 //! Alignment estimate of radio2 relative to radio1 (over the overlap band).
 struct overlap_alignment
 {
-    double gain        = 1.0;  //!< |radio1/radio2| amplitude ratio
-    double phase_rad   = 0.0;  //!< constant phase offset (rad)
-    double delay_samps = 0.0;  //!< fractional delay at target_rate (samples)
-    bool valid         = false;
+    double gain      = 1.0;  //!< |radio1/radio2| amplitude ratio
+    double phase_rad = 0.0;  //!< constant phase offset (rad)
+    bool valid       = false;
 };
 
 class BONDED_API overlap_reconstructor
@@ -67,8 +62,8 @@ public:
     /*!
      * One-shot reconstruction of a finite capture (offline / unit test).
      * rx1, rx2 are equal-duration complex baseband captures at per_radio_rate.
-     * Returns the combined baseband at target_rate.  Performs a two-pass
-     * alignment estimate over the whole capture.
+     * Returns the combined baseband at target_rate.  Starts from a fresh
+     * state, like reset() followed by process().
      */
     std::vector<std::complex<float>> reconstruct(
         const std::vector<std::complex<float>>& rx1,
@@ -77,22 +72,40 @@ public:
     /*!
      * Streaming reconstruction (real-time / GNU Radio).
      * Consumes n samples from each radio (at per_radio_rate) and returns the
-     * combined samples (at target_rate) ready so far.  Alignment is estimated
-     * adaptively from the overlap and stabilises after the first frames.
-     * Maintains internal resampler / translation / overlap-save state across
-     * calls; call reset() to start a new stream.
+     * combined samples (at target_rate) ready so far.  Filter and alignment
+     * state is kept across calls; call reset() to start a new stream.
      */
     std::vector<std::complex<float>> process(
         const std::complex<float>* rx1, const std::complex<float>* rx2, size_t n);
 
+    /*!
+     * Streaming reconstruction without copying the internal output buffer.
+     * The returned reference remains valid until the next process/process_view/reset call.
+     */
+    const std::vector<std::complex<float>>& process_view(
+        const std::complex<float>* rx1, const std::complex<float>* rx2, size_t n);
+
+    /*!
+     * Like process_view(), but the final combine writes up to `cap` samples
+     * straight into `dst` (typically the GNU Radio output buffer). Returns
+     * how many samples were written to `dst`; whatever did not fit is left in
+     * pending() and must be drained before the next call.  Only the frozen
+     * path writes directly; during the warmup everything goes to pending().
+     */
+    size_t process_into(const std::complex<float>* rx1,
+        const std::complex<float>* rx2,
+        size_t n,
+        std::complex<float>* dst,
+        size_t cap);
+
+    //! Output samples from the last process_into() that did not fit in `dst`.
+    const std::vector<std::complex<float>>& pending() const;
+
     //! Clear all streaming state.
     void reset();
 
-    //! Alignment recovered by the last reconstruct()/process() activity.
+    //! Alignment estimated so far (frozen once the warmup is over).
     const overlap_alignment& alignment() const { return _alignment; }
-
-    //! Override the alignment estimate (e.g. hold a previous estimate).
-    void set_alignment(const overlap_alignment& a) { _alignment = a; }
 
     const overlap_reconstructor_config& config() const { return _cfg; }
 
@@ -103,13 +116,5 @@ private:
     overlap_alignment _alignment;
     std::shared_ptr<impl> _impl;
 };
-
-/*!
- * Polyphase rational resampler (one-shot) for complex baseband.
- * Resamples x by the ratio interp/decim with a windowed-sinc anti-alias filter.
- * Shared by the reconstructor and by the test band-splitter.
- */
-BONDED_API std::vector<std::complex<float>> rational_resample(
-    const std::vector<std::complex<float>>& x, size_t interp, size_t decim);
 
 } // namespace bonded

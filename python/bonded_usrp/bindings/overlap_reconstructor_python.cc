@@ -19,6 +19,5 @@ void bind_overlap_reconstructor(py::module& m)
              py::arg("target_bw"),
              py::arg("overlap_bw"),
              py::arg("radio1_offset"),
-             py::arg("radio2_offset"),
-             py::arg("fft_size") = 4096);
+             py::arg("radio2_offset"));
 }

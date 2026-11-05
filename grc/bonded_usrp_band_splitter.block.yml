@@ -1,0 +1,65 @@
+id: bonded_usrp_band_splitter
+label: Band Splitter
+category: '[bonded_usrp]'
+
+templates:
+  imports: |-
+    from gnuradio import bonded_usrp
+  make: |-
+    bonded_usrp.band_splitter(${rate_in}, ${rate_out}, ${radio1_offset}, ${radio2_offset}, ${taps_per_phase})
+
+parameters:
+  - id: rate_in
+    label: Wideband Rate (Hz)
+    dtype: real
+    default: 20e6
+  - id: rate_out
+    label: Per-radio Rate (Hz)
+    dtype: real
+    default: 10e6
+  - id: radio1_offset
+    label: Radio1 Offset (Hz)
+    dtype: real
+    default: -4.375e6
+  - id: radio2_offset
+    label: Radio2 Offset (Hz)
+    dtype: real
+    default: 4.375e6
+  - id: taps_per_phase
+    label: Split Taps/Phase
+    dtype: int
+    default: 64
+
+inputs:
+  - label: wideband
+    domain: stream
+    dtype: complex
+
+outputs:
+  - label: radio1
+    domain: stream
+    dtype: complex
+  - label: radio2
+    domain: stream
+    dtype: complex
+
+documentation: |-
+  Wideband band splitter (TX side).
+
+  Splits one wideband complex baseband stream (at rate_in) at its centre into
+  two per-radio streams (each at rate_out): each half is translated to DC and
+  polyphase-resampled. Each radio's filter is a lowpass of half-width
+  |radio offset|, so both filters' -6 dB points meet at the centre seam (the
+  unused DC subcarrier of 802.11 and similar OFDM signals).
+
+  radio1_offset/radio2_offset are each radio's centre minus fc (Hz) and must
+  match the frequencies the radios are tuned to. 2*|offset| must not exceed
+  rate_out. rate_in/4 is the classic plan; the default 14/64*rate_in keeps the
+  seam away from the radios' own band edge, where their DUC rolls off, while
+  still covering the 26 used subcarriers each side of 802.11.
+
+  Split Taps/Phase sets the split filter's length. Subcarriers inside its
+  transition are radiated by both radios, which are not phase-coherent, so
+  they can fade; 64 keeps the transition within +-1 802.11 subcarrier.
+
+file_format: 1

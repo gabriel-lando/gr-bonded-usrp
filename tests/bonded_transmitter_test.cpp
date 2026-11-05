@@ -2,180 +2,139 @@
 // Copyright 2026 Gabriel Lando
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// No-hardware unit tests for bonded_transmitter.
-//
-// All tests avoid opening UHD devices (configure() is never called).
-// They exercise config validation, delay-trim mathematics, freq-plan
-// geometry, and underrun-counter initialisation — pure logic.
+// No-hardware unit tests for bonded_transmitter: configuration checks, the
+// live phase-offset API, guards against use before configure(), and the
+// per-device frequency/phase correction. configure() (which opens devices)
+// is never called.
 //
 
 #include "bonded_transmitter.hpp"
 #include <boost/test/unit_test.hpp>
+#include <uhd/exception.hpp>
 #include <cmath>
+#include <complex>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
 using namespace bonded;
 
-// ---------------------------------------------------------------------------
-// Helper: build a minimal two-radio config without serials that trigger HW.
-// ---------------------------------------------------------------------------
 namespace {
 
-bonded_transmitter::config make_cfg(double fc = 2.412e9,
-    double per_radio_rate = 10e6)
+using cf = std::complex<float>;
+constexpr double kPi = 3.14159265358979323846;
+
+bonded_transmitter::config make_cfg()
 {
     bonded_transmitter::config cfg;
-    cfg.serials  = {"AAA", "BBB"};
-    cfg.freq     = fc;
-    cfg.rate     = per_radio_rate;
-    cfg.gain     = 0.0;
-    cfg.strict   = false;
-    // Use internal clocks so no hardware lock is needed (tests never call
-    // configure()).
+    cfg.serials      = {"AAA", "BBB"};
+    cfg.freq         = 2.412e9;
+    cfg.rate         = 10e6;
     cfg.clock_source = "internal";
     cfg.time_source  = "internal";
     return cfg;
 }
 
+std::vector<cf> random_samples(size_t n, unsigned seed)
+{
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-1.f, 1.f);
+    std::vector<cf> x(n);
+    for (auto& v : x) {
+        v = cf(u(rng), u(rng));
+    }
+    return x;
+}
+
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Test 1: Default config values are sane.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_default_config)
-{
-    const auto cfg = make_cfg(2.412e9, 10e6);
-    BOOST_CHECK_EQUAL(cfg.serials.size(), size_t(2));
-    BOOST_CHECK_CLOSE(cfg.freq, 2.412e9, 0.001);
-    BOOST_CHECK_CLOSE(cfg.rate, 10e6, 0.001);
-    BOOST_CHECK(cfg.sample_delay_trim.empty());
-    BOOST_CHECK(!cfg.strict);
-}
-
-// ---------------------------------------------------------------------------
-// Test 2: Mismatched sample_delay_trim length must be rejected at construction.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_delay_trim_size_mismatch)
-{
-    auto cfg               = make_cfg();
-    cfg.sample_delay_trim  = {0, 3, 7}; // three entries but only two serials
-    BOOST_CHECK_THROW(bonded_transmitter tx(cfg), std::invalid_argument);
-}
-
-// ---------------------------------------------------------------------------
-// Test 3: Valid delay trim (same length as serials) is accepted.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_delay_trim_valid)
+BOOST_AUTO_TEST_CASE(test_bonded_transmitter_rejects_bad_delay_trim)
 {
     auto cfg              = make_cfg();
-    cfg.sample_delay_trim = {0, 5}; // two entries, two serials
+    cfg.sample_delay_trim = {0, 3, 7}; // three entries, two serials
+    BOOST_CHECK_THROW(bonded_transmitter tx(cfg), std::invalid_argument);
+    cfg.sample_delay_trim = {0, 5};
     BOOST_CHECK_NO_THROW(bonded_transmitter tx(cfg));
 }
 
-// ---------------------------------------------------------------------------
-// Test 4: Freq-plan geometry — two-radio standard setup.
-//
-// For a 20 MHz wideband channel at fc, the per-radio rate is 10 MHz and the
-// two radios are centred at fc ± 5 MHz (i.e. ± per_radio_rate/2).
-// Verify the expected offsets are ±5 MHz.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_freq_plan_geometry)
+BOOST_AUTO_TEST_CASE(test_bonded_transmitter_initial_state)
 {
-    const double fc            = 2.412e9;
-    const double per_radio     = 10e6;
-    const double expected_half = per_radio / 2.0; // 5 MHz
-
-    auto cfg       = make_cfg(fc, per_radio);
-    cfg.freq_plan  = {fc - expected_half, fc + expected_half};
-
-    BOOST_REQUIRE_EQUAL(cfg.freq_plan.size(), size_t(2));
-    BOOST_CHECK_CLOSE(cfg.freq_plan[0], fc - expected_half, 0.001);
-    BOOST_CHECK_CLOSE(cfg.freq_plan[1], fc + expected_half, 0.001);
-
-    // The offset from fc must be exactly ±per_radio/2.
-    const double off0 = cfg.freq_plan[0] - cfg.freq;
-    const double off1 = cfg.freq_plan[1] - cfg.freq;
-    BOOST_CHECK_CLOSE(off0, -expected_half, 0.001);
-    BOOST_CHECK_CLOSE(off1, +expected_half, 0.001);
-    BOOST_CHECK_CLOSE(std::abs(off0), std::abs(off1), 0.001);
-}
-
-// ---------------------------------------------------------------------------
-// Test 5: Freq-plan size mismatch (≠ serials) must be rejected at configure()
-// time — since configure() opens hardware we verify the config is inconsistent
-// by checking the pre-condition through the expected field layout.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_freq_plan_mismatch_detected)
-{
-    auto cfg      = make_cfg();
-    cfg.freq_plan = {2.407e9}; // only one entry for two radios
-    // The bonded_transmitter constructor itself does not validate freq_plan
-    // (configure() does).  But we can verify the config is logically
-    // inconsistent (freq_plan.size() != serials.size()).
-    BOOST_CHECK(cfg.freq_plan.size() != cfg.serials.size());
-}
-
-// ---------------------------------------------------------------------------
-// Test 6: Delay trim mathematics — verify that the integer sample offset
-// correctly represents the timing error correction.
-//
-// At 10 MHz rate, one sample = 100 ns.  A trim of +16 samples delays device
-// B by 1600 ns, well within the 802.11 CP (800 ns) × 2 budget.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_delay_trim_timing)
-{
-    const double per_radio_rate = 10e6;
-    const double sample_period_ns = 1e9 / per_radio_rate; // 100 ns
-
-    // The maximum useful trim is one cyclic-prefix length (0.8 µs = 8 samples
-    // at 10 MHz).  Verify the arithmetic.
-    const int trim_samples   = 8;
-    const double delay_ns    = trim_samples * sample_period_ns;
-    const double cp_ns       = 800.0; // 802.11a/g cyclic prefix
-
-    BOOST_CHECK_CLOSE(sample_period_ns, 100.0, 0.001);
-    BOOST_CHECK_CLOSE(delay_ns, 800.0, 0.001);
-    BOOST_CHECK_LE(delay_ns, cp_ns);
-
-    auto cfg              = make_cfg(2.412e9, per_radio_rate);
-    cfg.sample_delay_trim = {0, trim_samples};
-    bonded_transmitter tx(cfg);
-
+    bonded_transmitter tx(make_cfg());
     BOOST_CHECK_EQUAL(tx.num_devices(), size_t(2));
     BOOST_CHECK(!tx.is_configured());
     BOOST_CHECK(!tx.is_streaming());
+    BOOST_CHECK_EQUAL(tx.frames_sent(), 0u);
+    BOOST_CHECK(tx.get_underrun_counts().empty()); // no devices opened yet
 }
 
-// ---------------------------------------------------------------------------
-// Test 7: Underrun counters start at zero on a fresh object (before configure).
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_underrun_initial_zero)
+BOOST_AUTO_TEST_CASE(test_bonded_transmitter_phase_offset_api)
 {
-    auto cfg = make_cfg();
+    auto cfg             = make_cfg();
+    cfg.phase_offset_rad = {0.25};
     bonded_transmitter tx(cfg);
-    // Before configure() there are no streamers; underrun_counts is empty.
-    const auto counts = tx.get_underrun_counts();
-    BOOST_CHECK(counts.empty());
+    BOOST_CHECK_EQUAL(tx.get_phase_offset(0), 0.25); // from the config
+    BOOST_CHECK_EQUAL(tx.get_phase_offset(1), 0.0);  // missing entry -> 0
+    tx.set_phase_offset(1, -1.5);
+    BOOST_CHECK_EQUAL(tx.get_phase_offset(1), -1.5);
+    BOOST_CHECK_THROW(tx.set_phase_offset(2, 0.1), std::out_of_range);
+    BOOST_CHECK_EQUAL(tx.get_phase_offset(7), 0.0);
 }
 
-// ---------------------------------------------------------------------------
-// Test 8: send_burst() before configure() must throw.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_send_before_configure_throws)
+BOOST_AUTO_TEST_CASE(test_bonded_transmitter_requires_configure)
 {
-    auto cfg = make_cfg();
-    bonded_transmitter tx(cfg);
-    const std::vector<std::vector<std::complex<float>>> dummy(2);
-    BOOST_CHECK_THROW(tx.send_burst(dummy, 1.0), uhd::runtime_error);
-}
-
-// ---------------------------------------------------------------------------
-// Test 9: start_continuous() before configure() must throw.
-// ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(test_bonded_transmitter_start_continuous_before_configure)
-{
-    auto cfg = make_cfg();
-    bonded_transmitter tx(cfg);
+    bonded_transmitter tx(make_cfg());
     BOOST_CHECK_THROW(tx.start_continuous(), uhd::runtime_error);
+    const cf z(0, 0);
+    BOOST_CHECK_THROW(tx.queue_samples({&z, &z}, 1), uhd::runtime_error);
+    BOOST_CHECK_NO_THROW(tx.stop()); // no-op when not streaming
+}
+
+BOOST_AUTO_TEST_CASE(test_phase_correction_identity_and_constant_phase)
+{
+    const std::vector<cf> x = random_samples(1000, 1);
+    std::vector<cf> y = x;
+    detail::apply_phase_correction(y, 0.0, 0.0, 10e6, 12345);
+    BOOST_CHECK(y == x);
+
+    const double ph = 0.7;
+    detail::apply_phase_correction(y, 0.0, ph, 10e6, 0);
+    const cf rot(static_cast<float>(std::cos(ph)), static_cast<float>(std::sin(ph)));
+    for (size_t i = 0; i < x.size(); i++) {
+        BOOST_REQUIRE_SMALL(std::abs(y[i] - x[i] * rot), 1e-6f);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_phase_correction_frequency_is_continuous_across_chunks)
+{
+    // A frequency correction applied chunk by chunk, with the running sample
+    // index as reference, must equal the correction of the whole stream.
+    const double rate = 10e6, f = 12.5, ph = -0.3;
+    const std::vector<cf> x = random_samples(30000, 2);
+
+    std::vector<cf> whole = x;
+    detail::apply_phase_correction(whole, f, ph, rate, 5000);
+
+    std::vector<cf> chunked;
+    uint64_t index = 5000;
+    const std::vector<size_t> sizes = {1, 4, 13, 40, 1000, 4096};
+    for (size_t off = 0, c = 0; off < x.size(); c++) {
+        const size_t n = std::min(sizes[c % sizes.size()], x.size() - off);
+        std::vector<cf> part(x.begin() + static_cast<std::ptrdiff_t>(off),
+            x.begin() + static_cast<std::ptrdiff_t>(off + n));
+        detail::apply_phase_correction(part, f, ph, rate, index);
+        chunked.insert(chunked.end(), part.begin(), part.end());
+        index += n;
+        off += n;
+    }
+    BOOST_REQUIRE_EQUAL(chunked.size(), whole.size());
+    for (size_t i = 0; i < whole.size(); i++) {
+        BOOST_REQUIRE_SMALL(std::abs(chunked[i] - whole[i]), 1e-6f);
+    }
+
+    // And it is the expected rotation: sample k of the stream turns by
+    // 2*pi*f*k/rate + ph.
+    const size_t k = 777;
+    const double a = 2.0 * kPi * f * static_cast<double>(5000 + k) / rate + ph;
+    const cf expect = x[k] * cf(static_cast<float>(std::cos(a)), static_cast<float>(std::sin(a)));
+    BOOST_CHECK_SMALL(std::abs(whole[k] - expect), 1e-6f);
 }

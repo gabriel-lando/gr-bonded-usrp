@@ -4,20 +4,24 @@
 //
 // End-to-end (no hardware) validation of the overlap-aware reconstruction.
 //
-// A known wideband signal at the target rate is split — in software — into two
-// overlapping 15 MHz slices (the inverse of what the bonded radios do), a known
-// gain/phase offset is injected on the second slice, and the reconstructor is
-// asked to rebuild the original 20 MHz baseband.  We then check that
-//   (a) the alignment estimate recovers the injected gain/phase,
-//   (b) the reconstruction matches the original (low residual) across the band,
-//       including the overlap seam.
+// A known wideband signal at the target rate is split in software into two
+// overlapping slices (what the bonded radios capture), a known gain/phase
+// offset is injected on the second slice, and the reconstructor rebuilds the
+// original baseband. The tests check the alignment estimate, band flatness
+// (including the overlap seam), the warmup and frozen paths, streaming,
+// threading and the direct-output API.
 //
 
 #include "overlap_reconstructor.hpp"
+#include "test_helpers.hpp"
 #include <boost/test/unit_test.hpp>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
+#include <numeric>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace bonded;
@@ -65,14 +69,14 @@ std::vector<cf> freq_shift(const std::vector<cf>& x, double rate, double shift_h
 }
 
 // Software model of one radio: tune to `center_hz` (relative to fc), capture at
-// per_radio_rate. Shift so center maps to DC, then resample target->per_radio.
+// target_rate*interp/decim (default 20 -> 15 MS/s).
 std::vector<cf> make_slice(const std::vector<cf>& wb,
-    double target_rate, double center_hz)
+    double target_rate, double center_hz, size_t interp = 3, size_t decim = 4)
 {
     const std::vector<cf> shifted = freq_shift(wb, target_rate, -center_hz);
-    // 20e6 -> 15e6 == 3/4
-    return rational_resample(shifted, 3, 4);
+    return bonded_test::rational_resample(shifted, interp, decim);
 }
+
 
 // Best complex scale c minimizing ||a - c*b|| and the resulting normalized MSE.
 double residual_nmse(const std::vector<cf>& a, const std::vector<cf>& b,
@@ -134,6 +138,54 @@ size_t best_lag(const std::vector<cf>& orig, const std::vector<cf>& rec,
     return best;
 }
 
+// Per-tone gain of `out` relative to `wb` over [i0, i1): {mean, min, max}.
+struct flatness
+{
+    double mean, gmin, gmax;
+};
+flatness measure_flatness(const std::vector<cf>& wb, const std::vector<cf>& out,
+    double rate, const std::vector<double>& tones, size_t i0, size_t i1)
+{
+    std::vector<double> gains;
+    for (double f : tones) {
+        const double in  = std::abs(tone_amp(wb, rate, f, i0, i1));
+        const double rec = std::abs(tone_amp(out, rate, f, i0, i1));
+        gains.push_back(in > 1e-9 ? rec / in : 0.0);
+    }
+    flatness r{std::accumulate(gains.begin(), gains.end(), 0.0) / gains.size(),
+        gains[0], gains[0]};
+    for (double g : gains) {
+        r.gmin = std::min(r.gmin, g);
+        r.gmax = std::max(r.gmax, g);
+    }
+    return r;
+}
+
+// Stream rx1/rx2 through process() in the given repeating chunk sizes.
+std::vector<cf> stream_through(overlap_reconstructor& recon, const std::vector<cf>& rx1,
+    const std::vector<cf>& rx2, const std::vector<size_t>& chunks)
+{
+    const size_t n = std::min(rx1.size(), rx2.size());
+    std::vector<cf> out;
+    size_t i = 0, c = 0;
+    while (i < n) {
+        const size_t sz = std::min(chunks[c % chunks.size()], n - i);
+        const std::vector<cf> piece = recon.process(&rx1[i], &rx2[i], sz);
+        out.insert(out.end(), piece.begin(), piece.end());
+        i += sz;
+        c++;
+    }
+    return out;
+}
+
+// Sets an environment variable for the lifetime of the object.
+struct scoped_env
+{
+    std::string name;
+    scoped_env(const char* n, const char* v) : name(n) { setenv(n, v, 1); }
+    ~scoped_env() { unsetenv(name.c_str()); }
+};
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_fidelity_and_alignment)
@@ -169,7 +221,6 @@ BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_fidelity_and_alignment)
     cfg.overlap_bw       = 5e6;
     cfg.radio1_offset_hz = -5e6;
     cfg.radio2_offset_hz = +5e6;
-    cfg.fft_size         = 4096;
 
     // Reconstruct without and with the injected offset.
     overlap_reconstructor recon_no(cfg);
@@ -249,6 +300,61 @@ BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_seam_tone)
     BOOST_CHECK_LT(nmse, 0.02);
 }
 
+BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_frozen_steady_state)
+{
+    // Exercise the frozen (steady-state) path: with a short warmup window the
+    // reconstructor estimates+freezes alignment early, then runs its fast path
+    // for the remainder. Fidelity over the frozen region must match the warmup
+    // path's band-flat response (no seam/spur/gain regression at the switch).
+    const double fc_rate = 20e6;
+    const size_t N       = 131072;
+    const std::vector<double> tones = {-9e6, -5e6, -1e6, 1e6, 5e6, 9e6};
+    const std::vector<cf> wb = make_wideband(N, fc_rate, tones);
+
+    const std::vector<cf> rx1 = make_slice(wb, fc_rate, -5e6);
+    const std::vector<cf> rx2 = make_slice(wb, fc_rate, +5e6);
+    const size_t n = std::min(rx1.size(), rx2.size());
+
+    overlap_reconstructor_config cfg; // defaults match this geometry
+    cfg.warmup_samples = 20000;       // freeze early so most output is frozen
+
+    overlap_reconstructor recon(cfg);
+    std::vector<cf> out;
+    const std::vector<size_t> chunks = {4096, 8192, 2048, 16384};
+    size_t i = 0, c = 0;
+    while (i < n) {
+        const size_t sz = std::min(chunks[c % chunks.size()], n - i);
+        const std::vector<cf> piece = recon.process(&rx1[i], &rx2[i], sz);
+        out.insert(out.end(), piece.begin(), piece.end());
+        i += sz;
+        c++;
+    }
+    BOOST_REQUIRE(out.size() > N / 2);
+    BOOST_REQUIRE(recon.alignment().valid);
+
+    // Check fidelity well past the freeze point (warmup ~20k output samples).
+    const size_t i0 = 40000, i1 = out.size() - 8192;
+    BOOST_REQUIRE(i1 > i0);
+    std::vector<double> gains;
+    for (double f : tones) {
+        const double in  = std::abs(tone_amp(wb, fc_rate, f, i0, i1));
+        const double rec = std::abs(tone_amp(out, fc_rate, f, i0, i1));
+        BOOST_REQUIRE(in > 1e-6);
+        gains.push_back(rec / in);
+    }
+    const double mean =
+        std::accumulate(gains.begin(), gains.end(), 0.0) / gains.size();
+    double gmin = gains[0], gmax = gains[0];
+    for (double g : gains) { gmin = std::min(gmin, g); gmax = std::max(gmax, g); }
+    const double spur = std::abs(tone_amp(out, fc_rate, 7e6, i0, i1)) / mean;
+    BOOST_TEST_MESSAGE("frozen: out=" << out.size() << " mean gain=" << mean
+                       << " flatness=[" << gmin << ", " << gmax
+                       << "] spur/mean=" << spur);
+    BOOST_CHECK_GT(gmin, 0.85 * mean);
+    BOOST_CHECK_LT(gmax, 1.15 * mean);
+    BOOST_CHECK_LT(spur, 0.06);
+}
+
 BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_streaming)
 {
     // The streaming path (process() fed in small chunks) must produce a
@@ -299,4 +405,211 @@ BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_streaming)
     BOOST_CHECK_GT(gmin, 0.85 * mean);
     BOOST_CHECK_LT(gmax, 1.15 * mean);
     BOOST_CHECK_LT(spur, 0.06);
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_edge_aligned_plan)
+{
+    // The plan used live: 20 MHz channel, 5 MHz overlap, each radio captures
+    // exactly [fc-10, fc+2.5] or [fc-2.5, fc+10] at 12.5 MS/s, at fc -/+ 3.75.
+    // The overlap content is symmetric (equal-amplitude tone pairs): the gain
+    // estimate is a power ratio over the overlap, and each radio's anti-alias
+    // roll-off attenuates the far side of it, which cancels for a flat
+    // spectrum such as 802.11 but biases the gain for lopsided content.
+    const double fc_rate = 20e6;
+    const size_t N       = 131072;
+    const std::vector<double> tones = {-8e6, -5e6, -1.5e6, -0.4e6, 0.4e6, 1.5e6, 5e6, 8e6};
+    std::vector<cf> wb(N, cf(0, 0));
+    for (size_t t = 0; t < tones.size(); t++) {
+        const auto x = bonded_test::tone(tones[t], fc_rate, N, 0.9 * static_cast<double>(t), 0.5);
+        for (size_t i = 0; i < N; i++) {
+            wb[i] += x[i];
+        }
+    }
+    const std::vector<cf> rx1 = make_slice(wb, fc_rate, -3.75e6, 5, 8);
+    const std::vector<cf> rx2 = make_slice(wb, fc_rate, +3.75e6, 5, 8);
+
+    overlap_reconstructor_config cfg;
+    cfg.per_radio_rate   = 12.5e6;
+    cfg.radio1_offset_hz = -3.75e6;
+    cfg.radio2_offset_hz = +3.75e6;
+    cfg.warmup_samples   = 20000;
+    overlap_reconstructor recon(cfg);
+    const std::vector<cf> out = stream_through(recon, rx1, rx2, {4096, 3000, 8192});
+    BOOST_REQUIRE(recon.alignment().valid);
+    BOOST_REQUIRE(out.size() > N / 2);
+
+    const auto fl = measure_flatness(wb, out, fc_rate, tones, 40000, out.size() - 8192);
+    const double spur = std::abs(tone_amp(out, fc_rate, 3e6, 40000, out.size() - 8192)) / fl.mean;
+    BOOST_TEST_MESSAGE("edge-aligned: mean=" << fl.mean << " [" << fl.gmin << ", "
+                                             << fl.gmax << "] spur=" << spur);
+    BOOST_CHECK_GT(fl.gmin, 0.97 * fl.mean);
+    BOOST_CHECK_LT(fl.gmax, 1.03 * fl.mean);
+    BOOST_CHECK_LT(spur, 0.01);
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_threads_match_serial)
+{
+    // The frozen path splits each call's output range across BONDED_THREADS
+    // threads; the result must match the single-threaded one (up to the tiny
+    // difference between the recursive and the closed-form rotator phase).
+    const double fc_rate = 20e6;
+    const size_t N       = 65536;
+    const std::vector<cf> wb = make_wideband(N, fc_rate, {-7e6, -1e6, 2e6, 6e6});
+    const std::vector<cf> rx1 = make_slice(wb, fc_rate, -5e6);
+    const std::vector<cf> rx2 = make_slice(wb, fc_rate, +5e6);
+
+    overlap_reconstructor_config cfg;
+    cfg.warmup_samples = 4096;
+    const std::vector<size_t> chunks = {8192, 4096, 2048, 12000}; // >= 2048: parallel
+
+    std::vector<cf> serial, threaded;
+    {
+        scoped_env env("BONDED_THREADS", "1");
+        overlap_reconstructor recon(cfg);
+        serial = stream_through(recon, rx1, rx2, chunks);
+    }
+    for (const char* nt : {"2", "3", "4", "7"}) {
+        scoped_env env("BONDED_THREADS", nt);
+        overlap_reconstructor recon(cfg);
+        threaded = stream_through(recon, rx1, rx2, chunks);
+        BOOST_REQUIRE_EQUAL(threaded.size(), serial.size());
+        double err = 0.0, ref = 0.0;
+        for (size_t i = 0; i < serial.size(); i++) {
+            err += std::norm(threaded[i] - serial[i]);
+            ref += std::norm(serial[i]);
+        }
+        BOOST_TEST_MESSAGE("threads=" << nt << " rel err=" << err / ref);
+        BOOST_CHECK_LT(err / ref, 1e-6);
+    }
+    {
+        scoped_env env("BONDED_PARALLEL", "0");
+        overlap_reconstructor recon(cfg);
+        const std::vector<cf> off = stream_through(recon, rx1, rx2, chunks);
+        BOOST_REQUIRE_EQUAL(off.size(), serial.size());
+        double err = 0.0;
+        for (size_t i = 0; i < serial.size(); i++) {
+            err += std::norm(off[i] - serial[i]);
+        }
+        BOOST_CHECK_EQUAL(err, 0.0);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_process_into_matches_process)
+{
+    // process_into() + pending() must produce what process() does, whatever
+    // the destination capacity (including capacities smaller than a call's
+    // output, which spill into pending()). The two combine loops may be
+    // vectorized differently (-ffast-math), hence a 1e-6 tolerance.
+    const double fc_rate = 20e6;
+    const size_t N       = 65536;
+    const std::vector<cf> wb = make_wideband(N, fc_rate, {-6e6, 0.5e6, 7e6});
+    const std::vector<cf> rx1 = make_slice(wb, fc_rate, -5e6);
+    const std::vector<cf> rx2 = make_slice(wb, fc_rate, +5e6);
+    const size_t n = std::min(rx1.size(), rx2.size());
+
+    overlap_reconstructor_config cfg;
+    cfg.warmup_samples = 8192;
+    overlap_reconstructor ref_recon(cfg);
+    const std::vector<cf> ref = stream_through(ref_recon, rx1, rx2, {4096});
+
+    for (size_t cap : {size_t(100000), size_t(5000), size_t(1)}) {
+        overlap_reconstructor recon(cfg);
+        std::vector<cf> out, dst(cap);
+        size_t direct = 0;
+        for (size_t i = 0; i < n; i += 4096) {
+            const size_t sz = std::min<size_t>(4096, n - i);
+            const size_t w = recon.process_into(&rx1[i], &rx2[i], sz, dst.data(), cap);
+            BOOST_REQUIRE_LE(w, cap);
+            out.insert(out.end(), dst.begin(), dst.begin() + static_cast<std::ptrdiff_t>(w));
+            const auto& rest = recon.pending();
+            out.insert(out.end(), rest.begin(), rest.end());
+            direct += w;
+        }
+        BOOST_TEST_MESSAGE("cap=" << cap << " direct=" << direct << " total=" << out.size());
+        BOOST_CHECK_GT(direct, 0u); // the frozen path did write directly
+        BOOST_REQUIRE_EQUAL(out.size(), ref.size());
+        for (size_t i = 0; i < out.size(); i++) {
+            if (std::abs(out[i] - ref[i]) > 1e-6f * (1.0f + std::abs(ref[i]))) {
+                BOOST_FAIL("cap " << cap << ": differs at sample " << i);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_restarts_from_scratch)
+{
+    // reconstruct() resets the state, so two calls give identical output, and
+    // reset() makes process() start over too.
+    const double fc_rate = 20e6;
+    const std::vector<cf> wb = make_wideband(32768, fc_rate, {-4e6, 3e6});
+    const std::vector<cf> rx1 = make_slice(wb, fc_rate, -5e6);
+    const std::vector<cf> rx2 = make_slice(wb, fc_rate, +5e6);
+    overlap_reconstructor recon(overlap_reconstructor_config{});
+    const std::vector<cf> a = recon.reconstruct(rx1, rx2);
+    const std::vector<cf> b = recon.reconstruct(rx1, rx2);
+    BOOST_CHECK(a == b);
+    recon.reset();
+    const std::vector<cf> c = recon.process(rx1.data(), rx2.data(), std::min(rx1.size(), rx2.size()));
+    BOOST_CHECK(a == c);
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_rejects_bad_config)
+{
+    overlap_reconstructor_config cfg;
+    cfg.target_rate = 0;
+    BOOST_CHECK_THROW(overlap_reconstructor{cfg}, std::invalid_argument);
+    cfg            = overlap_reconstructor_config{};
+    cfg.per_radio_rate = -1;
+    BOOST_CHECK_THROW(overlap_reconstructor{cfg}, std::invalid_argument);
+    cfg            = overlap_reconstructor_config{};
+    cfg.overlap_bw = 0;
+    BOOST_CHECK_THROW(overlap_reconstructor{cfg}, std::invalid_argument);
+    BOOST_CHECK_NO_THROW(overlap_reconstructor{overlap_reconstructor_config{}});
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_frozen_path_continues_warmup_path)
+{
+    // After the freeze the fused path must produce the same samples the
+    // warmup path would have (same timeline, same per-radio phase), for any
+    // freeze point. A fused path restarting its own timeline at the freeze
+    // changes each radio's translation phase by a different amount, which
+    // leaves the frozen alignment off and notches the overlap.
+    struct plan
+    {
+        double per_radio, offset;
+        size_t L, M;
+    };
+    const double fc_rate = 20e6;
+    const size_t N       = 98304;
+    const std::vector<cf> wb = make_wideband(N, fc_rate, {-7e6, -2e6, -0.7e6, 0.4e6, 1.8e6, 6e6});
+    for (const plan& p : {plan{15e6, 5e6, 3, 4}, plan{12.5e6, 3.75e6, 5, 8}}) {
+        const std::vector<cf> rx1 = make_slice(wb, fc_rate, -p.offset, p.L, p.M);
+        const std::vector<cf> rx2 = make_slice(wb, fc_rate, +p.offset, p.L, p.M);
+        overlap_reconstructor_config cfg;
+        cfg.per_radio_rate   = p.per_radio;
+        cfg.radio1_offset_hz = -p.offset;
+        cfg.radio2_offset_hz = +p.offset;
+        cfg.warmup_samples   = 1u << 30; // never freezes: warmup path only
+        overlap_reconstructor ref_recon(cfg);
+        const std::vector<size_t> chunks = {3000, 4096, 1111};
+        const std::vector<cf> ref = stream_through(ref_recon, rx1, rx2, chunks);
+
+        for (size_t warmup : {5000u, 10001u, 20000u, 33333u}) {
+            cfg.warmup_samples = warmup;
+            overlap_reconstructor recon(cfg);
+            const std::vector<cf> out = stream_through(recon, rx1, rx2, chunks);
+            BOOST_REQUIRE_EQUAL(out.size(), ref.size());
+            // Compare from just after the freeze (the call that crosses
+            // `warmup` still runs the warmup path) to the end.
+            const size_t from = warmup + 8192;
+            double err = 0.0, energy = 0.0;
+            for (size_t i = from; i < out.size(); i++) {
+                err += std::norm(out[i] - ref[i]);
+                energy += std::norm(ref[i]);
+            }
+            BOOST_TEST_MESSAGE("plan " << p.per_radio / 1e6 << " MS/s, warmup " << warmup
+                                       << ": frozen vs warmup rel err " << err / energy);
+            BOOST_CHECK_LT(err / energy, 1e-6);
+        }
+    }
 }

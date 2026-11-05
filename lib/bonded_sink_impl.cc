@@ -1,9 +1,10 @@
 #include "bonded_sink_impl.h"
 
+#include "bonded_csv.hpp"
 #include "bonded_transmitter.hpp"
 #include <gnuradio/io_signature.h>
 
-#include <sstream>
+#include <stdexcept>
 
 namespace gr {
 namespace bonded_usrp {
@@ -51,27 +52,44 @@ bonded_sink_impl::bonded_sink_impl(const std::string& serials_csv,
     const std::string& phase_offset_csv)
     : gr::sync_block("bonded_sink",
           gr::io_signature::make(2, 2, sizeof(gr_complex)),
-          gr::io_signature::make(0, 0, 0)),
-      _rate(rate)
+          gr::io_signature::make(0, 0, 0))
 {
+    using bonded::detail::parse_csv_doubles;
     bonded::bonded_transmitter::config cfg;
-    cfg.serials       = _parse_serials(serials_csv);
-    cfg.clock_source  = clock_source;
-    cfg.time_source   = time_source;
-    cfg.rate          = rate;
-    cfg.freq          = freq;
-    cfg.gain          = gain;
-    cfg.gain_plan     = _parse_freq_plan(gain_plan_csv); // generic double-CSV parse
-    cfg.freq_offset_hz   = _parse_freq_plan(freq_offset_csv);
-    cfg.phase_offset_rad = _parse_freq_plan(phase_offset_csv);
-    cfg.subdev        = subdev;
-    cfg.freq_plan     = _parse_freq_plan(freq_plan_csv);
+    cfg.serials = bonded::detail::split_csv(serials_csv);
+    if (cfg.serials.size() != 2) {
+        throw std::invalid_argument("bonded_sink requires exactly 2 serials in serials_csv");
+    }
+    const auto per_device = [&](const std::string& csv, const char* name) {
+        auto v = parse_csv_doubles(csv, name);
+        if (!v.empty() && v.size() != cfg.serials.size()) {
+            throw std::invalid_argument(
+                std::string("bonded_sink: ") + name + " must be empty or have 2 values");
+        }
+        return v;
+    };
+    cfg.clock_source     = clock_source;
+    cfg.time_source      = time_source;
+    cfg.rate             = rate;
+    cfg.freq             = freq;
+    cfg.gain             = gain;
+    cfg.gain_plan        = per_device(gain_plan_csv, "gain_plan_csv");
+    cfg.freq_offset_hz   = per_device(freq_offset_csv, "freq_offset_csv");
+    cfg.phase_offset_rad = per_device(phase_offset_csv, "phase_offset_csv");
+    cfg.subdev           = subdev;
+    cfg.freq_plan        = per_device(freq_plan_csv, "freq_plan_csv");
     cfg.stream_args   = stream_args;
     cfg.strict        = strict_lock;
     cfg.lock_timeout  = lock_timeout;
     cfg.sample_delay_trim = {delay_trim_a, delay_trim_b};
 
     _tx = std::make_unique<bonded::bonded_transmitter>(cfg);
+
+    // Device setup takes seconds, so it runs here and not in start(): GNU
+    // Radio does not order start() across blocks, and upstream message
+    // sources would otherwise queue seconds of frames that then go out as
+    // one burst when streaming begins.
+    _tx->configure();
 }
 
 bonded_sink_impl::~bonded_sink_impl() = default;
@@ -80,7 +98,6 @@ bool bonded_sink_impl::start()
 {
     std::lock_guard<std::mutex> lk(_state_mutex);
     if (_running) return true;
-    _tx->configure();
     _tx->start_continuous();
     _running = true;
     return true;
@@ -111,38 +128,18 @@ int bonded_sink_impl::work(int noutput_items,
     return noutput_items;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-std::vector<std::string> bonded_sink_impl::_parse_serials(
-    const std::string& csv)
+void bonded_sink_impl::set_phase_offset(int device, double rad)
 {
-    std::vector<std::string> out;
-    std::istringstream ss(csv);
-    std::string tok;
-    while (std::getline(ss, tok, ',')) {
-        while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
-        while (!tok.empty() && tok.back() == ' ') tok.pop_back();
-        if (!tok.empty()) out.push_back(tok);
-    }
-    return out;
+    _tx->set_phase_offset(static_cast<size_t>(device), rad);
 }
 
-std::vector<double> bonded_sink_impl::_parse_freq_plan(const std::string& csv)
+double bonded_sink_impl::phase_offset(int device) const
 {
-    if (csv.empty()) return {};
-    std::vector<double> out;
-    std::istringstream ss(csv);
-    std::string tok;
-    while (std::getline(ss, tok, ',')) {
-        try {
-            out.push_back(std::stod(tok));
-        } catch (...) {
-        }
-    }
-    return out;
+    return _tx->get_phase_offset(static_cast<size_t>(device));
 }
+
+uint64_t bonded_sink_impl::frames_sent() const { return _tx->frames_sent(); }
+
 
 } // namespace bonded_usrp
 } // namespace gr

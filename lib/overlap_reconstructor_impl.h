@@ -20,8 +20,7 @@ public:
                                double target_bw,
                                double overlap_bw,
                                double radio1_offset,
-                               double radio2_offset,
-                               int fft_size);
+                               double radio2_offset);
     ~overlap_reconstructor_impl() override;
 
     bool start() override;
@@ -39,6 +38,7 @@ private:
     std::unique_ptr<bonded::overlap_reconstructor> _recon;
     std::vector<gr_complex> _leftover; // reconstructed samples not yet emitted
     size_t _lead = 0;                  // read offset into _leftover
+    bool _direct_out = true;           // BONDED_DIRECT_OUT=0 restores the copy path
 };
 
 } // namespace bonded_usrp

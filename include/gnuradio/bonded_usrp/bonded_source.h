@@ -8,6 +8,17 @@
 namespace gr {
 namespace bonded_usrp {
 
+/*!
+ * \brief Bonded USRP source block (RX side).
+ *
+ * Streams from N B210s (normally two) sharing an external 10 MHz reference
+ * and PPS, aligned by device timestamp. Two output ports per device:
+ * port 2*d + ch is device d, channel ch. A block in which any device lost
+ * samples is dropped on every device, so the outputs stay aligned.
+ *
+ * Runtime tuning (environment): BONDED_SRC_BUFFER (output buffer in items,
+ * default 262144), BONDED_RX_PROFILE=1 (per-second acquisition profile).
+ */
 class BONDED_USRP_API bonded_source : virtual public gr::sync_block
 {
 public:

@@ -5,6 +5,7 @@ namespace py = pybind11;
 void bind_bonded_source(py::module& m);
 void bind_overlap_reconstructor(py::module& m);
 void bind_bonded_sink(py::module& m);
+void bind_band_splitter(py::module& m);
 
 PYBIND11_MODULE(bonded_usrp_python, m)
 {
@@ -12,4 +13,5 @@ PYBIND11_MODULE(bonded_usrp_python, m)
     bind_bonded_source(m);
     bind_overlap_reconstructor(m);
     bind_bonded_sink(m);
+    bind_band_splitter(m);
 }

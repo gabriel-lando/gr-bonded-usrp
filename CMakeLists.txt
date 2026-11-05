@@ -11,7 +11,7 @@ list(INSERT CMAKE_MODULE_PATH 0 ${PROJECT_SOURCE_DIR}/cmake/Modules)
 find_package(Gnuradio "3.10" REQUIRED COMPONENTS runtime)
 find_package(UHD REQUIRED)
 
-# Boost.Test for the hardware-free C++ unit tests (optional).
+# Boost.Test for the hardware-free unit tests (optional).
 option(ENABLE_TESTING "Build the C++ unit tests" ON)
 find_package(Boost COMPONENTS unit_test_framework)
 
@@ -21,8 +21,6 @@ include(GrMinReq)
 include(GrCompilerSettings)
 include(GrPython)
 include(GrPybind)
-
-set(GR_PKG_DATA_DIR ${GR_DATA_DIR}/${CMAKE_PROJECT_NAME})
 
 if(NOT CMAKE_MODULES_DIR)
     set(CMAKE_MODULES_DIR lib${LIB_SUFFIX}/cmake)

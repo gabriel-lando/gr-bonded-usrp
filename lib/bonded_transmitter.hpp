@@ -10,9 +10,13 @@
 #include <uhd/types/time_spec.hpp>
 #include <uhd/usrp/multi_usrp.hpp>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <complex>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -20,21 +24,54 @@
 
 namespace bonded {
 
+namespace detail {
+
+//! Rotate samples in place by exp(j(2*pi*freq_hz*(first_index + k)/rate +
+//! phase_rad)), k = 0..n-1: the per-device frequency/phase correction, with
+//! time referenced to the sample count since the stream started.
+inline void apply_phase_correction(std::vector<std::complex<float>>& samp,
+    double freq_hz,
+    double phase_rad,
+    double rate,
+    uint64_t first_index)
+{
+    if (freq_hz == 0.0) {
+        if (phase_rad == 0.0) {
+            return;
+        }
+        const std::complex<float> rot(
+            static_cast<float>(std::cos(phase_rad)), static_cast<float>(std::sin(phase_rad)));
+        for (auto& v : samp) {
+            v *= rot;
+        }
+        return;
+    }
+    constexpr double kTwoPi = 6.283185307179586476925286766559;
+    for (size_t k = 0; k < samp.size(); k++) {
+        const double t  = static_cast<double>(first_index + k) / rate;
+        const double ph = kTwoPi * freq_hz * t + phase_rad;
+        samp[k] *= std::complex<float>(
+            static_cast<float>(std::cos(ph)), static_cast<float>(std::sin(ph)));
+    }
+}
+
+} // namespace detail
+
 /*!
- * Synchronized wideband transmitter using two bonded B210s.
+ * Synchronized multi-device transmitter (the engine behind bonded_sink).
  *
- * Mirrors bonded_receiver: opens two devices on a shared external 10 MHz
- * reference + PPS, configures TX hardware to fc ± T/4 center frequencies,
- * aligns their clocks to a common t=0 via the PPS edge, and provides both
- * burst (timed) and continuous (queued) transmission.
+ * configure() opens the devices, locks them to the shared 10 MHz reference,
+ * tunes them and sets their clocks to a common time on a PPS edge.
+ * start_continuous() then streams for the whole session: queue_samples()
+ * appends data, and whenever no data is queued the radios get zeros, so they
+ * never drop to idle (a B210 needs several hundred microseconds to ramp TX
+ * power back up, longer than an 802.11 preamble). A scheduler thread hands the
+ * identical block sequence to one sender thread per device, all starting at
+ * the same device time; if any device underruns, every device restarts on a
+ * new common start time, since an underrun shifts that device's timeline.
  *
- * The band_splitter engine produces the per-radio streams; this class only
- * manages the device/sync/TX-streamer lifecycle.
- *
- * Per-device integer sample-delay trim: positive trim T pads device d's
- * output with T zero samples at the start, delaying its effective start by
- * T / per_radio_rate seconds relative to the common time base.  This corrects
- * any residual inter-device skew that survives the shared 10 MHz + PPS sync.
+ * Per-device sample-delay trim: a positive trim T sends T extra zeros on that
+ * device after each (re)start, delaying it by T / rate seconds.
  */
 class BONDED_API bonded_transmitter
 {
@@ -52,16 +89,14 @@ public:
                                          //!< gains [0,1]; overrides `gain`.
                                          //!< Empty or same length as serials.
 
-        //! Per-device phase-coherence correction (inter-radio calibration).
-        //! Applied as a digital NCO rotation on that device's TX samples,
-        //! referenced to the shared clock so it tracks LO drift across bursts:
-        //!   s'[k] = s[k] * exp(j(2*pi*freq_offset_hz[d]*(t0 + k/rate)
-        //!                         + phase_offset_rad[d]))
-        //! Use freq_offset_hz to freeze the inter-radio relative CFO and
-        //! phase_offset_rad to pin the relative phase. Empty or len==serials.
+        //! Per-device digital frequency (Hz) and phase (rad) correction, see
+        //! detail::apply_phase_correction(). Empty or one entry per serial.
         std::vector<double> freq_offset_hz;
         std::vector<double> phase_offset_rad;
 
+        //! Extra UHD device args for every device (more TX frames in flight
+        //! absorb host scheduling hiccups at high rates).
+        std::string device_args = "num_send_frames=256";
         std::string subdev;              //!< Optional subdev spec
         std::string stream_args;         //!< Optional TX stream args
         bool strict        = false;      //!< Throw on lock failure vs. warn
@@ -71,13 +106,6 @@ public:
         //! Positive value T: prepend T zero-samples to that device's stream.
         //! Must be either empty (no trim) or the same length as serials.
         std::vector<int> sample_delay_trim;
-    };
-
-    //! Result of a transmit operation.
-    struct tx_result {
-        std::vector<bool> success;         //!< Per-device transmit success
-        std::vector<size_t> underrun_counts; //!< Per-device underrun count
-        std::string error_message;         //!< Non-empty on failure
     };
 
     explicit bonded_transmitter(const config& cfg);
@@ -94,39 +122,24 @@ public:
      */
     void configure();
 
-    // --- Burst mode ---
-
-    /*!
-     * Send a one-shot timed burst on all devices simultaneously.
-     *
-     * \param samples   Per-device complex samples (samples[device_index])
-     * \param delay_sec Start time = now() + delay_sec
-     * \return tx_result with per-device success + underrun counts
-     */
-    tx_result send_burst(
-        const std::vector<std::vector<std::complex<float>>>& samples,
-        double delay_sec = 1.5);
-
     // --- Continuous mode ---
 
     /*!
-     * Start background send threads and arm a continuous timed TX stream.
-     * Call queue_samples() to push data; call stop() when done.
+     * Start the scheduler and sender threads; streaming starts 0.5 s later on
+     * a common device time. Call queue_samples() to send data, stop() to end.
      */
     void start_continuous();
 
     /*!
-     * Push n samples per device into the send queues.
-     * Thread-safe; called from the GNU Radio work thread.
-     *
-     * \param ptrs  ptrs[d] points to n complex<float> samples for device d
-     * \param n     Number of samples per device
+     * Queue n samples per device (ptrs[d] points to device d's samples).
+     * Thread-safe.
      */
     void queue_samples(const std::vector<const std::complex<float>*>& ptrs,
         size_t n);
 
     /*!
-     * Stop continuous streaming: flush queues, join send threads.
+     * Stop streaming: whatever is still queued is sent, then the bursts end
+     * and the scheduler and sender threads are joined.
      */
     void stop();
 
@@ -136,11 +149,23 @@ public:
     bool is_configured() const { return _configured; }
     std::vector<size_t> get_underrun_counts() const;
 
+    //! Frames (runs of real data between idle zero-fill) sent so far.
+    uint64_t frames_sent() const;
+
+    /*!
+     * Change device d's phase rotation while streaming (applied from the next
+     * queued chunk on).  The radios' LOs are not phase-coherent, so the
+     * relative phase of the two halves is arbitrary per session but stable
+     * within it.  Near 180 deg the subcarriers next to the seam see ISI (the
+     * two split filters no longer sum to an impulse); near 0 the split is
+     * transparent, so a receiver can measure the phase and feed it back here.
+     */
+    void set_phase_offset(size_t device, double rad);
+    double get_phase_offset(size_t device) const;
+
 private:
-    // One queued item holds the per-device samples from a single GR work()
-    // call.  Storing both devices together (rather than in separate per-device
-    // queues) guarantees the two half-bands can never drift apart: they are
-    // always dequeued as one coupled unit and sent in the same timed burst.
+    // The per-device samples of one queue_samples() call, kept together so
+    // the devices always receive the same sequence.
     struct tx_chunk {
         std::vector<std::vector<std::complex<float>>> per_dev; // per_dev[device]
     };
@@ -153,16 +178,45 @@ private:
     std::vector<uhd::usrp::multi_usrp::sptr> _devices;
     std::vector<uhd::tx_streamer::sptr> _streamers;
 
-    // Continuous mode: a single coupled queue drained by one send thread that
-    // emits each 802.11 frame as one PPS-timed burst on all devices.
     std::deque<tx_chunk> _tx_queue;
     std::mutex _tx_mutex;
     std::condition_variable _tx_cv;
-    std::thread _send_thread;
-    std::atomic<bool> _stop_flag{false};
+    std::thread _send_thread; // scheduler (_send_loop_continuous)
 
-    // Async-message threads count underruns from the TX streamer.
+    // Per-device feed: the scheduler pushes the same sequence of blocks to
+    // every feed; that device's sender thread drains it with send(). A
+    // resync item closes the current burst and opens a new one at `start`;
+    // the end item (pushed last, on stop) ends the burst and the thread.
+    struct feed_item {
+        std::shared_ptr<const std::vector<std::complex<float>>> buf;
+        bool resync = false;
+        bool end    = false;
+        uhd::time_spec_t start;
+    };
+    struct dev_feed {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<feed_item> q;
+        size_t queued = 0; // samples in q
+    };
+    std::vector<std::unique_ptr<dev_feed>> _feeds;
+    std::vector<std::thread> _dev_threads;
+    std::mutex _sched_mu;
+    std::condition_variable _sched_cv;
+    std::atomic<bool> _resync_request{false};
+    std::atomic<uint64_t> _resyncs{0};
+    std::chrono::steady_clock::time_point _last_resync_req{};
+    std::atomic<bool> _stop_flag{false};
+    std::atomic<uint64_t> _frames_sent{0};
+
+    // Live copy of config.phase_offset_rad (settable while streaming).
+    mutable std::mutex _phase_mutex;
+    std::vector<double> _phase_offset;
+
+    // Async-message threads (one per device, from configure() until
+    // destruction) count underruns and request the re-alignment.
     std::vector<std::thread> _async_threads;
+    std::atomic<bool> _async_stop{false};
     std::vector<std::atomic<size_t>> _underrun_counts;
 
     // Internal helpers.
@@ -171,7 +225,8 @@ private:
     void _configure_hardware();
     void _create_streamers();
     void _align_time();
-    void _send_loop_burst();
+    void _send_loop_continuous();
+    void _device_send_loop(size_t device_index);
     void _async_msg_loop(size_t device_index);
 };
 

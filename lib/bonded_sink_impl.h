@@ -42,11 +42,11 @@ public:
              gr_vector_const_void_star& input_items,
              gr_vector_void_star& output_items) override;
 
-private:
-    static std::vector<std::string> _parse_serials(const std::string& csv);
-    static std::vector<double> _parse_freq_plan(const std::string& csv);
+    void set_phase_offset(int device, double rad) override;
+    double phase_offset(int device) const override;
+    uint64_t frames_sent() const override;
 
-    double _rate;
+private:
     bool _running = false;
     std::mutex _state_mutex;
     std::unique_ptr<bonded::bonded_transmitter> _tx;

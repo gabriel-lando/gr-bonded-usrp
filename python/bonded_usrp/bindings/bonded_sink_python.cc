@@ -30,5 +30,9 @@ void bind_bonded_sink(py::module& m)
              py::arg("delay_trim_b")   = 0,
              py::arg("gain_plan_csv")  = "",
              py::arg("freq_offset_csv")  = "",
-             py::arg("phase_offset_csv") = "");
+             py::arg("phase_offset_csv") = "")
+        .def("set_phase_offset", &bonded_sink::set_phase_offset,
+             py::arg("device"), py::arg("rad"))
+        .def("phase_offset", &bonded_sink::phase_offset, py::arg("device"))
+        .def("frames_sent", &bonded_sink::frames_sent);
 }

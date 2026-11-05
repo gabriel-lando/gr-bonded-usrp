@@ -11,7 +11,7 @@
 #include <boost/format.hpp>
 #include <algorithm>
 #include <chrono>
-#include <cmath>
+#include <cstdint>
 #include <iostream>
 
 namespace bonded {
@@ -24,12 +24,35 @@ bonded_transmitter::bonded_transmitter(const config& cfg) : _config(cfg)
             "bonded_transmitter: sample_delay_trim must be empty or match "
             "the number of serials");
     }
+    _phase_offset.assign(cfg.serials.size(), 0.0);
+    for (size_t d = 0; d < cfg.phase_offset_rad.size() && d < cfg.serials.size(); d++) {
+        _phase_offset[d] = cfg.phase_offset_rad[d];
+    }
+}
+
+void bonded_transmitter::set_phase_offset(size_t device, double rad)
+{
+    std::lock_guard<std::mutex> lk(_phase_mutex);
+    if (device >= _phase_offset.size()) {
+        throw std::out_of_range("bonded_transmitter::set_phase_offset: bad device");
+    }
+    _phase_offset[device] = rad;
+}
+
+double bonded_transmitter::get_phase_offset(size_t device) const
+{
+    std::lock_guard<std::mutex> lk(_phase_mutex);
+    return device < _phase_offset.size() ? _phase_offset[device] : 0.0;
 }
 
 bonded_transmitter::~bonded_transmitter()
 {
     if (_streaming) {
         stop();
+    }
+    _async_stop.store(true);
+    for (auto& t : _async_threads) {
+        if (t.joinable()) t.join();
     }
 }
 
@@ -47,105 +70,6 @@ void bonded_transmitter::configure()
     _create_streamers();
     _align_time();
     _configured = true;
-}
-
-// =========================================================================
-// Burst mode
-// =========================================================================
-bonded_transmitter::tx_result bonded_transmitter::send_burst(
-    const std::vector<std::vector<std::complex<float>>>& samples,
-    double delay_sec)
-{
-    if (!_configured) {
-        throw uhd::runtime_error(
-            "bonded_transmitter::send_burst() called before configure()");
-    }
-    if (_streaming) {
-        throw uhd::runtime_error(
-            "bonded_transmitter::send_burst() called while continuous streaming");
-    }
-    if (samples.size() != _devices.size()) {
-        throw std::invalid_argument(
-            "bonded_transmitter::send_burst(): samples must have one entry "
-            "per device");
-    }
-
-    const size_t num_dev = _devices.size();
-    tx_result result;
-    result.success.assign(num_dev, false);
-    result.underrun_counts.assign(num_dev, 0);
-
-    const uhd::time_spec_t start_time =
-        _devices[0]->get_time_now() + uhd::time_spec_t(delay_sec);
-
-    std::cout << boost::format(
-                     "[bonded_transmitter] Scheduling burst at t=%.6f s\n")
-                     % start_time.get_real_secs();
-
-    // Send from each device in parallel threads.
-    std::mutex print_mu;
-    auto send_fn = [&](size_t d) {
-        auto& streamer       = _streamers[d];
-        const auto& dev_samp = samples[d];
-
-        // Apply integer sample-delay trim: prepend zeros if trim[d] > 0.
-        std::vector<std::complex<float>> padded;
-        const std::complex<float>* send_ptr = dev_samp.data();
-        size_t send_n                       = dev_samp.size();
-        if (!_config.sample_delay_trim.empty() && _config.sample_delay_trim[d] > 0) {
-            const size_t pad = static_cast<size_t>(_config.sample_delay_trim[d]);
-            padded.resize(pad + dev_samp.size(), std::complex<float>(0.0f, 0.0f));
-            std::copy(dev_samp.begin(), dev_samp.end(), padded.begin() + pad);
-            send_ptr = padded.data();
-            send_n   = padded.size();
-        }
-
-        uhd::tx_metadata_t md;
-        md.start_of_burst = true;
-        md.end_of_burst   = false;
-        md.has_time_spec  = true;
-        md.time_spec      = start_time;
-
-        const size_t buf_sz = streamer->get_max_num_samps();
-        size_t total        = 0;
-        bool ok             = true;
-
-        while (total < send_n) {
-            const bool last = (total + buf_sz >= send_n);
-            if (last) {
-                md.end_of_burst = true;
-            }
-            const size_t chunk = std::min(buf_sz, send_n - total);
-            const std::vector<const std::complex<float>*> ptrs = {send_ptr + total};
-            const size_t n = streamer->send(ptrs, chunk, md, 1.0);
-            if (n == 0) {
-                std::lock_guard<std::mutex> lock(print_mu);
-                std::cerr << boost::format(
-                                 "[bonded_transmitter] Device %u: send() returned 0\n")
-                                 % d;
-                ok = false;
-                break;
-            }
-            md.start_of_burst = false;
-            md.has_time_spec  = false;
-            total += n;
-        }
-        result.success[d] = ok;
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(num_dev);
-    for (size_t d = 0; d < num_dev; d++) {
-        threads.emplace_back(send_fn, d);
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    for (size_t d = 0; d < num_dev; d++) {
-        result.underrun_counts[d] = _underrun_counts[d].load();
-    }
-    return result;
 }
 
 // =========================================================================
@@ -167,16 +91,20 @@ void bonded_transmitter::start_continuous()
         std::lock_guard<std::mutex> lk(_tx_mutex);
         _tx_queue.clear();
     }
-    _underrun_counts = std::vector<std::atomic<size_t>>(num_dev);
+    // The async threads are already running: reset the counters in place.
     for (size_t d = 0; d < num_dev; d++) {
         _underrun_counts[d].store(0);
     }
+    _resync_request.store(false);
 
-    // Single consumer thread: drains the coupled queue and sends each 802.11
-    // frame as one timed burst on the shared PPS time base (see
-    // _send_loop_burst).  The per-device sample-delay trim is applied per
-    // burst inside that loop.
-    _send_thread = std::thread([this]() { _send_loop_burst(); });
+    // One sender thread per device, fed by one scheduler thread that keeps
+    // the TX front-end continuously streaming (see _send_loop_continuous).
+    _feeds.clear();
+    for (size_t d = 0; d < num_dev; d++) _feeds.push_back(std::make_unique<dev_feed>());
+    for (size_t d = 0; d < num_dev; d++) {
+        _dev_threads.emplace_back(&bonded_transmitter::_device_send_loop, this, d);
+    }
+    _send_thread = std::thread([this]() { _send_loop_continuous(); });
 
     _streaming = true;
 }
@@ -209,21 +137,25 @@ void bonded_transmitter::stop()
 {
     if (!_streaming) return;
 
+    // The scheduler hands what is still queued to the senders and then an
+    // end marker; each sender sends everything before it and ends its burst.
+    // (GNU Radio stops the blocks as soon as a finite source is exhausted, so
+    // dropping the queue here would cut the end of the input.)
     _stop_flag.store(true);
-
-    // Wake the send thread so it can exit.
     _tx_cv.notify_all();
+    _sched_cv.notify_all();
     if (_send_thread.joinable()) _send_thread.join();
-
-    for (auto& t : _async_threads) {
+    for (auto& t : _dev_threads) {
         if (t.joinable()) t.join();
     }
-    _async_threads.clear();
-    {
-        std::lock_guard<std::mutex> lk(_tx_mutex);
-        _tx_queue.clear();
-    }
+    _dev_threads.clear();
+    _feeds.clear();
     _streaming = false;
+}
+
+uint64_t bonded_transmitter::frames_sent() const
+{
+    return _frames_sent.load();
 }
 
 std::vector<size_t> bonded_transmitter::get_underrun_counts() const
@@ -246,7 +178,7 @@ void bonded_transmitter::_open_devices()
                      % _config.serials.size();
 
     for (const auto& serial : _config.serials) {
-        uhd::device_addr_t dev_args;
+        uhd::device_addr_t dev_args(_config.device_args);
         dev_args["serial"] = serial;
         std::cout << boost::format(
                          "[bonded_transmitter] Opening serial=%s ...\n")
@@ -254,7 +186,6 @@ void bonded_transmitter::_open_devices()
         _devices.push_back(uhd::usrp::multi_usrp::make(dev_args));
     }
 
-    // Init underrun counters here (size is now known).
     _underrun_counts = std::vector<std::atomic<size_t>>(_devices.size());
     for (auto& c : _underrun_counts) c.store(0);
 }
@@ -351,8 +282,7 @@ void bonded_transmitter::_configure_hardware()
                          % (usrp->get_tx_freq(0) / 1e6) % dev_gain % nch
                          % (use_freq_plan ? " (freq_plan)" : "");
     }
-    // Bonded TX uses exactly one TX chain per device (one half-band per B210).
-    // Force this regardless of how many channels the device advertises.
+    // One TX chain per device (one half-band per B210).
     _channels_per_device = 1;
 }
 
@@ -370,7 +300,6 @@ void bonded_transmitter::_create_streamers()
         _streamers.push_back(_devices[d]->get_tx_stream(sa));
     }
 
-    // Start async-message listener threads (one per device).
     _async_threads.reserve(_devices.size());
     for (size_t d = 0; d < _devices.size(); d++) {
         _async_threads.emplace_back(
@@ -418,147 +347,259 @@ void bonded_transmitter::_align_time()
     }
 }
 
-void bonded_transmitter::_send_loop_burst()
+void bonded_transmitter::_send_loop_continuous()
 {
+    // Scheduler: decides what is sent (queued data, or zeros when there is
+    // none) and hands the identical sequence to every device's feed; one
+    // sender thread per device (_device_send_loop) does the blocking send().
+    // Every device gets the same sample count in the same order, which with
+    // a common timed start keeps the halves sample-aligned. (A single thread
+    // sending to the devices in turn cannot keep up past ~2x20 MS/s.)
     uhd::set_thread_priority_safe();
 
     const size_t num_dev = _devices.size();
+    constexpr size_t kFillChunk = 4096; // samples/device per idle-fill block
+    const auto zeros = std::make_shared<const std::vector<std::complex<float>>>(
+        kFillChunk, std::complex<float>(0.0f, 0.0f));
+    // Samples kept queued ahead per device: absorbs the linger below and host
+    // scheduling hiccups.
+    const size_t target = std::max<size_t>(4 * kFillChunk,
+        static_cast<size_t>(_config.rate * 0.02));
 
-    // A frame boundary is a lull in the queue.  Consecutive GR work() chunks
-    // for the same 802.11 frame arrive < ~200 µs apart; the inter-frame strobe
-    // gap is hundreds of ms.  A few ms cleanly separates the two cases.
-    constexpr auto kFrameGap = std::chrono::milliseconds(5);
-    // Schedule each burst this far in the future so its samples are copied into
-    // the FPGA TX FIFO before the timestamp arrives.  A frame is only a few
-    // thousand samples, so 30 ms is ample and stays well inside the ~300 ms
-    // inter-frame gap.
-    const double kBurstDelay = 0.03; // seconds
+    auto push_all = [&](std::vector<std::shared_ptr<const std::vector<std::complex<float>>>> bufs,
+                        bool resync_marker, const uhd::time_spec_t& t) {
+        for (size_t d = 0; d < num_dev; d++) {
+            auto& f = *_feeds[d];
+            {
+                std::lock_guard<std::mutex> lk(f.mu);
+                feed_item it;
+                it.resync = resync_marker;
+                it.start  = t;
+                if (!resync_marker) {
+                    it.buf = bufs[d];
+                    f.queued += it.buf->size();
+                }
+                f.q.push_back(std::move(it));
+            }
+            f.cv.notify_one();
+        }
+    };
+    auto min_queued = [&]() {
+        size_t m = SIZE_MAX;
+        for (auto& f : _feeds) {
+            std::lock_guard<std::mutex> lk(f->mu);
+            m = std::min(m, f->queued);
+        }
+        return m;
+    };
+    // Common (re)start: every device opens a new burst at the same future
+    // device time; used at session start and after any underrun.
+    auto schedule_start = [&](double lead_s) {
+        const uhd::time_spec_t t = _devices[0]->get_time_now() + uhd::time_spec_t(lead_s);
+        push_all({}, true, t);
+        std::cout << boost::format("[bonded_transmitter] %s continuous TX at t=%.6f s\n")
+                         % (_resyncs.load() ? "re-aligned" : "starting") % t.get_real_secs();
+    };
 
-    // Keeps consecutive bursts strictly ordered even if two frames happen to
-    // arrive closer together than kBurstDelay.
-    uhd::time_spec_t last_burst_end(0.0);
+    // Hands a batch of queued chunks to every feed, applying the per-device
+    // frequency/phase correction. A frame is a run of data between zero-fills
+    // (with the linger below, all chunks of one frame land in one run; frames
+    // closer together than kLinger count as one).
+    bool idle           = true; // last block scheduled was zero-fill (or nothing yet)
+    uint64_t total_sent = 0;    // samples scheduled per device (equal on all devices)
+    auto push_batch = [&](std::deque<tx_chunk>& batch) {
+        if (batch.empty()) {
+            return;
+        }
+        if (idle) {
+            _frames_sent.fetch_add(1);
+            idle = false;
+        }
+        for (auto& chunk : batch) {
+            const size_t n = chunk.per_dev[0].size();
+            std::vector<std::shared_ptr<const std::vector<std::complex<float>>>> bufs(num_dev);
+            for (size_t d = 0; d < num_dev; d++) {
+                auto& samp = chunk.per_dev[d];
+                const double fcorr = (d < _config.freq_offset_hz.size())
+                                          ? _config.freq_offset_hz[d]
+                                          : 0.0;
+                detail::apply_phase_correction(
+                    samp, fcorr, get_phase_offset(d), _config.rate, total_sent);
+                bufs[d] = std::make_shared<const std::vector<std::complex<float>>>(std::move(samp));
+            }
+            push_all(std::move(bufs), false, {});
+            total_sent += n;
+        }
+    };
 
-    // Per-device frame accumulator, reused across frames.
-    std::vector<std::vector<std::complex<float>>> frame(num_dev);
+    schedule_start(0.5);
+
+    // One frame reaches queue_samples() as several work() chunks; zero-filling
+    // as soon as the queue is momentarily empty would cut a hole into it. So
+    // right after data, wait briefly for the rest of the frame before
+    // resuming zero-fill (the feeds hold far more than this).
+    constexpr auto kLinger = std::chrono::milliseconds(2);
+    auto last_data = std::chrono::steady_clock::now() - kLinger;
 
     while (!_stop_flag.load()) {
-        // ---- Wait for the first chunk of the next frame --------------------
+        if (_resync_request.exchange(false)) {
+            _resyncs.fetch_add(1);
+            std::cerr << "[bonded_transmitter] underrun -> re-aligning all devices "
+                         "on a common start time\n";
+            // The new burst must begin after everything already queued (feeds
+            // and UHD's in-flight frames) has gone out on the old one.
+            schedule_start(0.5);
+        }
+
+        // Pace on the feeds: only schedule more once some device runs low.
+        {
+            std::unique_lock<std::mutex> lk(_sched_mu);
+            _sched_cv.wait_for(lk, std::chrono::milliseconds(5), [&] {
+                return min_queued() < target || _stop_flag.load() || _resync_request.load();
+            });
+        }
+        if (_stop_flag.load()) break;
+        if (min_queued() >= target) continue;
+
+        std::deque<tx_chunk> batch;
         {
             std::unique_lock<std::mutex> lk(_tx_mutex);
-            _tx_cv.wait(lk, [&]() {
-                return !_tx_queue.empty() || _stop_flag.load();
-            });
-            if (_stop_flag.load() && _tx_queue.empty()) break;
+            const auto linger_end = last_data + kLinger;
+            if (_tx_queue.empty() && std::chrono::steady_clock::now() < linger_end) {
+                _tx_cv.wait_until(lk, linger_end, [this] {
+                    return !_tx_queue.empty() || _stop_flag.load();
+                });
+            }
+            batch.swap(_tx_queue);
         }
 
-        // ---- Start a fresh frame; prepend per-device delay-trim zeros ------
-        // Applying the trim here (per burst) means it survives every frame,
-        // unlike a one-time pre-queue that drifts away.
-        for (size_t d = 0; d < num_dev; d++) {
-            frame[d].clear();
-            if (!_config.sample_delay_trim.empty()
-                && _config.sample_delay_trim[d] > 0) {
-                frame[d].assign(
-                    static_cast<size_t>(_config.sample_delay_trim[d]),
-                    std::complex<float>(0.0f, 0.0f));
-            }
+        if (batch.empty()) {
+            push_all(std::vector<std::shared_ptr<const std::vector<std::complex<float>>>>(num_dev, zeros),
+                false, {});
+            total_sent += kFillChunk;
+            idle = true;
+            continue;
         }
 
-        // ---- Accumulate coupled chunks until a gap ends the frame ----------
-        bool got_data = false;
-        while (!_stop_flag.load()) {
-            std::deque<tx_chunk> batch;
-            {
-                std::unique_lock<std::mutex> lk(_tx_mutex);
-                if (_tx_queue.empty()) {
-                    _tx_cv.wait_for(lk, kFrameGap, [&]() {
-                        return !_tx_queue.empty() || _stop_flag.load();
-                    });
-                }
-                if (_tx_queue.empty()) {
-                    break; // lull → frame complete
-                }
-                batch.swap(_tx_queue);
-            }
-            for (auto& chunk : batch) {
-                for (size_t d = 0; d < num_dev; d++) {
-                    auto& src = chunk.per_dev[d];
-                    frame[d].insert(frame[d].end(), src.begin(), src.end());
-                }
-                got_data = true;
-            }
-        }
-
-        if (!got_data) continue;
-
-        // ---- Emit the frame as ONE timed burst on every device ------------
-        // All devices share the same time_spec, so the half-bands are sample-
-        // aligned over the air regardless of send order, scheduling jitter, or
-        // any underrun in the preceding gap.
-        const uhd::time_spec_t now_ts = _devices[0]->get_time_now();
-        uhd::time_spec_t start = now_ts + uhd::time_spec_t(kBurstDelay);
-        if (start < last_burst_end) {
-            start = last_burst_end;
-        }
-
-        std::cerr << boost::format(
-                         "[bonded_transmitter] burst: %zu samp/dev  "
-                         "now=%.4f  start=%.4f\n")
-                         % frame[0].size() % now_ts.get_real_secs()
-                         % start.get_real_secs();
-
-        const double t0 = start.get_real_secs();
-        size_t max_len = 0;
-        for (size_t d = 0; d < num_dev; d++) {
-            const size_t total = frame[d].size();
-
-            // Inter-radio phase-coherence correction: rotate this device's
-            // samples by a digital NCO referenced to the shared-clock burst
-            // time t0, so it cancels relative LO drift across the inter-frame
-            // gap as well as within the burst.
-            const double fcorr =
-                (d < _config.freq_offset_hz.size()) ? _config.freq_offset_hz[d] : 0.0;
-            const double pcorr =
-                (d < _config.phase_offset_rad.size()) ? _config.phase_offset_rad[d] : 0.0;
-            if (fcorr != 0.0 || pcorr != 0.0) {
-                for (size_t k = 0; k < total; k++) {
-                    const double ph =
-                        2.0 * M_PI * fcorr * (t0 + static_cast<double>(k) / _config.rate)
-                        + pcorr;
-                    frame[d][k] *= std::complex<float>(
-                        static_cast<float>(std::cos(ph)), static_cast<float>(std::sin(ph)));
-                }
-            }
-
-            const std::complex<float>* ptr = frame[d].data();
-            max_len                        = std::max(max_len, total);
-            const size_t bs                = _streamers[d]->get_max_num_samps();
-
-            uhd::tx_metadata_t md;
-            md.start_of_burst = true;
-            md.end_of_burst   = false;
-            md.has_time_spec  = true;
-            md.time_spec      = start;
-
-            size_t off = 0;
-            while (off < total && !_stop_flag.load()) {
-                const size_t n   = std::min(bs, total - off);
-                md.end_of_burst  = (off + n >= total);
-                const std::vector<const std::complex<float>*> ptrs = {ptr + off};
-                _streamers[d]->send(ptrs, n, md, 0.1);
-                md.start_of_burst = false;
-                md.has_time_spec  = false;
-                off += n;
-            }
-        }
-        last_burst_end =
-            start + uhd::time_spec_t(static_cast<double>(max_len) / _config.rate);
+        push_batch(batch);
+        last_data = std::chrono::steady_clock::now();
     }
+
+    // Stopping: send what is still queued, then tell every sender to finish.
+    std::deque<tx_chunk> rest;
+    {
+        std::lock_guard<std::mutex> lk(_tx_mutex);
+        rest.swap(_tx_queue);
+    }
+    push_batch(rest);
+    for (auto& f : _feeds) {
+        {
+            std::lock_guard<std::mutex> lk(f->mu);
+            feed_item end;
+            end.end = true;
+            f->q.push_back(std::move(end));
+        }
+        f->cv.notify_one();
+    }
+}
+
+void bonded_transmitter::_device_send_loop(size_t d)
+{
+    uhd::set_thread_priority_safe();
+    auto& f        = *_feeds[d];
+    auto& streamer = _streamers[d];
+    const size_t bs = streamer->get_max_num_samps();
+
+    uhd::tx_metadata_t md;
+    bool in_burst = false;
+    const size_t trim = (!_config.sample_delay_trim.empty() && _config.sample_delay_trim[d] > 0)
+                            ? static_cast<size_t>(_config.sample_delay_trim[d])
+                            : 0;
+
+    // Send exactly n samples, in packets of at most bs. sent == 0 while the
+    // timed first packet of a burst is pending is normal until that time
+    // arrives (the FIFO is full and the burst has not started); only once the
+    // start time is well in the past do we fall back to an untimed send.
+    auto send_all = [&](const std::complex<float>* ptr, size_t n) -> bool {
+        size_t off       = 0;
+        int consec_fails = 0;
+        while (off < n) {
+            const size_t chunk = std::min(bs, n - off);
+            const std::vector<const std::complex<float>*> ptrs = {ptr + off};
+            const size_t sent = streamer->send(ptrs, chunk, md, 0.1);
+            if (sent == 0) {
+                if (md.has_time_spec) {
+                    if (_devices[d]->get_time_now() > md.time_spec + uhd::time_spec_t(0.05)) {
+                        std::cerr << boost::format("[bonded_transmitter] Device %u: start "
+                                                   "time missed, sending untimed\n") % d;
+                        md.has_time_spec = false;
+                    }
+                    continue;
+                }
+                if (++consec_fails >= 50) {
+                    std::cerr << boost::format(
+                                     "[bonded_transmitter] Device %u: send() "
+                                     "returned 0 repeatedly — giving up\n")
+                                     % d;
+                    return false;
+                }
+                continue;
+            }
+            consec_fails       = 0;
+            md.start_of_burst = false;
+            md.has_time_spec  = false;
+            off += sent;
+        }
+        return true;
+    };
+    auto end_burst = [&]() {
+        if (!in_burst) return;
+        uhd::tx_metadata_t end_md;
+        end_md.end_of_burst = true;
+        const std::complex<float> z(0.0f, 0.0f);
+        const std::vector<const std::complex<float>*> ptrs = {&z};
+        streamer->send(ptrs, 0, end_md, 0.1);
+        in_burst = false;
+    };
+
+    while (true) {
+        feed_item it;
+        {
+            std::unique_lock<std::mutex> lk(f.mu);
+            f.cv.wait(lk, [&] { return !f.q.empty(); });
+            it = std::move(f.q.front());
+            f.q.pop_front();
+        }
+        if (it.end) break;
+        if (it.resync) {
+            // Close the current burst and open the next one at the common
+            // start time; the per-device trim is relative to that start.
+            end_burst();
+            md                = uhd::tx_metadata_t();
+            md.start_of_burst = true;
+            md.has_time_spec  = true;
+            md.time_spec      = it.start;
+            in_burst          = true;
+            if (trim > 0) {
+                const std::vector<std::complex<float>> pad(trim, std::complex<float>(0.0f, 0.0f));
+                send_all(pad.data(), trim);
+            }
+            continue;
+        }
+        const bool ok = send_all(it.buf->data(), it.buf->size());
+        {
+            std::lock_guard<std::mutex> lk(f.mu);
+            f.queued -= it.buf->size();
+        }
+        _sched_cv.notify_one();
+        if (!ok) break;
+    }
+    end_burst();
 }
 
 void bonded_transmitter::_async_msg_loop(size_t d)
 {
-    while (!_stop_flag.load()) {
+    while (!_async_stop.load()) {
         uhd::async_metadata_t amd;
         if (_streamers[d]->recv_async_msg(amd, 0.05)) {
             switch (amd.event_code) {
@@ -569,6 +610,19 @@ void bonded_transmitter::_async_msg_loop(size_t d)
                                      "[bonded_transmitter] Device %u: underrun "
                                      "(U)\n")
                                      % d;
+                    // After an underrun the B210 resumes as soon as samples
+                    // arrive, so this device has slipped against the others.
+                    // Ask the scheduler to restart every device on a common
+                    // time (debounced: devices often report the same event).
+                    {
+                        const auto now = std::chrono::steady_clock::now();
+                        std::lock_guard<std::mutex> lk(_sched_mu);
+                        if (now - _last_resync_req > std::chrono::milliseconds(500)) {
+                            _last_resync_req = now;
+                            _resync_request.store(true);
+                        }
+                    }
+                    _sched_cv.notify_one();
                     break;
                 case uhd::async_metadata_t::EVENT_CODE_TIME_ERROR:
                     std::cerr << boost::format(

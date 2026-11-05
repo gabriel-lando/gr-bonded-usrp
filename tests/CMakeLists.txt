@@ -1,12 +1,14 @@
-# Hardware-free C++ unit tests for the bonded engine (Boost.Test, ctest).
-# Mirrors the former in-UHD setup: each test is its own executable with a
-# Boost-provided main.
+# Hardware-free C++ unit tests (Boost.Test, ctest); each test is its own
+# executable with a Boost-provided main.
 add_definitions(-DBOOST_TEST_DYN_LINK -DBOOST_TEST_MAIN)
 
 list(APPEND bonded_tests
-    overlap_reconstructor_test   # alignment recovery, band-flatness, seam, streaming
-    bonded_receiver_test         # burst-alignment / ring-buffer extraction (header-only)
-    bonded_transmitter_test)     # config / freq-plan geometry
+    overlap_reconstructor_test   # alignment, flatness, seam, frozen path, threads, direct output
+    bonded_resample_test         # filter design, dot kernels, polyphase resamplers
+    bonded_receiver_test         # timestamp alignment of the receive rings
+    bonded_transmitter_test      # config checks, phase API, frequency/phase correction
+    band_splitter_test           # TX split: flatness, half assignment, seam width, streaming
+    bonded_csv_test)             # block CSV parameters
 
 foreach(test_name ${bonded_tests})
     add_executable(${test_name} ${test_name}.cpp)

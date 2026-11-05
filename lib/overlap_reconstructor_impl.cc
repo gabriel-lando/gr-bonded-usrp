@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace gr {
 namespace bonded_usrp {
@@ -15,11 +17,10 @@ overlap_reconstructor::sptr overlap_reconstructor::make(double rate_in,
     double target_bw,
     double overlap_bw,
     double radio1_offset,
-    double radio2_offset,
-    int fft_size)
+    double radio2_offset)
 {
     return gnuradio::make_block_sptr<overlap_reconstructor_impl>(rate_in,
-        rate_out, target_bw, overlap_bw, radio1_offset, radio2_offset, fft_size);
+        rate_out, target_bw, overlap_bw, radio1_offset, radio2_offset);
 }
 
 overlap_reconstructor_impl::overlap_reconstructor_impl(double rate_in,
@@ -27,8 +28,7 @@ overlap_reconstructor_impl::overlap_reconstructor_impl(double rate_in,
     double target_bw,
     double overlap_bw,
     double radio1_offset,
-    double radio2_offset,
-    int fft_size)
+    double radio2_offset)
     : gr::block("overlap_reconstructor",
           gr::io_signature::make(2, 2, sizeof(gr_complex)),
           gr::io_signature::make(1, 1, sizeof(gr_complex))),
@@ -42,10 +42,26 @@ overlap_reconstructor_impl::overlap_reconstructor_impl(double rate_in,
     cfg.overlap_bw       = overlap_bw;
     cfg.radio1_offset_hz = radio1_offset;
     cfg.radio2_offset_hz = radio2_offset;
-    cfg.fft_size         = static_cast<size_t>(fft_size);
     _recon = std::make_unique<bonded::overlap_reconstructor>(cfg);
 
     set_relative_rate(rate_out / rate_in);
+
+    // Per-call overhead only amortizes when general_work() is handed many
+    // output samples at once: ask for multiples of a large chunk and an output
+    // buffer several chunks deep, so a slower downstream block (the 802.11 PHY)
+    // does not stall us immediately.
+    size_t chunk = 8192;
+    if (const char* env = std::getenv("BONDED_CHUNK")) {
+        const long v = std::strtol(env, nullptr, 10);
+        if (v > 0) {
+            chunk = static_cast<size_t>(v);
+        }
+    }
+    if (const char* env = std::getenv("BONDED_DIRECT_OUT")) {
+        _direct_out = (std::string(env) != "0");
+    }
+    set_output_multiple(static_cast<int>(chunk));
+    set_min_output_buffer(0, static_cast<long>(chunk * 8));
 }
 
 overlap_reconstructor_impl::~overlap_reconstructor_impl() = default;
@@ -94,23 +110,37 @@ int overlap_reconstructor_impl::general_work(int noutput_items,
         }
     }
 
-    // 2) Reconstruct from the input available this call (the time-domain
-    //    reconstructor streams correctly on any chunk size).
+    // 2) Reconstruct new input, consuming only about as much as fits in the
+    //    remaining output room. Taking everything available (up to
+    //    bonded_source's 262144-item buffer) would park most of the output in
+    //    _leftover and make this block and the one downstream run in series.
     int consumed = 0;
     if (produced < noutput_items && _leftover.empty()) {
         const int navail = std::min(ninput_items[0], ninput_items[1]);
         if (navail > 0) {
-            const std::vector<gr_complex> chunk =
-                _recon->process(in0, in1, static_cast<size_t>(navail));
-            consumed = navail;
             const size_t room = static_cast<size_t>(noutput_items - produced);
-            const size_t take = std::min(room, chunk.size());
-            std::memcpy(out + produced, chunk.data(), take * sizeof(gr_complex));
-            produced += static_cast<int>(take);
-            if (take < chunk.size()) {
-                _leftover.assign(chunk.begin() + static_cast<std::ptrdiff_t>(take),
-                    chunk.end());
-                _lead = 0;
+            const int want =
+                static_cast<int>(std::ceil(room * _rate_in / _rate_out));
+            consumed = std::min(navail, std::max(want, 1));
+            if (_direct_out) {
+                produced += static_cast<int>(_recon->process_into(
+                    in0, in1, static_cast<size_t>(consumed), out + produced, room));
+                const std::vector<gr_complex>& rest = _recon->pending();
+                if (!rest.empty()) {
+                    _leftover.assign(rest.begin(), rest.end());
+                    _lead = 0;
+                }
+            } else {
+                // Copy path (BONDED_DIRECT_OUT=0), for A/B measurements.
+                const std::vector<gr_complex>& res =
+                    _recon->process_view(in0, in1, static_cast<size_t>(consumed));
+                const size_t take = std::min(res.size(), room);
+                std::memcpy(out + produced, res.data(), take * sizeof(gr_complex));
+                produced += static_cast<int>(take);
+                if (take < res.size()) {
+                    _leftover.assign(res.begin() + take, res.end());
+                    _lead = 0;
+                }
             }
         }
     }

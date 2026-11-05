@@ -1,10 +1,13 @@
 #include "bonded_source_impl.h"
 
+#include "bonded_csv.hpp"
 #include "bonded_receiver.hpp"
 #include <gnuradio/io_signature.h>
 #include <algorithm>
-#include <cctype>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
@@ -24,7 +27,7 @@ bonded_source::sptr bonded_source::make(const std::string& serials_csv,
                                         const std::string& freq_plan_csv,
                                         const std::string& stream_args)
 {
-    return std::make_shared<bonded_source_impl>(serials_csv,
+    return gnuradio::make_block_sptr<bonded_source_impl>(serials_csv,
                                                 rate,
                                                 freq,
                                                 gain,
@@ -40,48 +43,45 @@ bonded_source::sptr bonded_source::make(const std::string& serials_csv,
 
 std::vector<std::string> bonded_source_impl::_parse_serials(const std::string& serials_csv)
 {
-    std::vector<std::string> serials;
-    std::stringstream ss(serials_csv);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        item.erase(std::remove_if(item.begin(),
-                                  item.end(),
-                                  [](unsigned char ch) { return std::isspace(ch) != 0; }),
-            item.end());
-        if (!item.empty()) {
-            serials.push_back(item);
-        }
-    }
+    auto serials = bonded::detail::split_csv(serials_csv);
     if (serials.size() < 2) {
         throw std::invalid_argument("bonded_source requires at least 2 serials in serials_csv");
     }
     return serials;
 }
 
-std::vector<int> bonded_source_impl::_make_output_signature(size_t nports)
+void bonded_source_impl::_log_fetch_issue(const std::string& reason,
+                                          int noutput_items,
+                                          const bonded::bonded_receiver::rx_result* result)
 {
-    return std::vector<int>(nports, sizeof(gr_complex));
-}
-
-std::vector<double> bonded_source_impl::_parse_freq_plan(const std::string& freq_plan_csv)
-{
-    std::vector<double> freqs;
-    if (freq_plan_csv.empty()) {
-        return freqs;
+    const auto now = std::chrono::steady_clock::now();
+    if (_last_fetch_log.time_since_epoch().count() != 0
+        && now - _last_fetch_log < std::chrono::seconds(1)) {
+        return;
     }
 
-    std::stringstream ss(freq_plan_csv);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        item.erase(std::remove_if(item.begin(),
-                                  item.end(),
-                                  [](unsigned char ch) { return std::isspace(ch) != 0; }),
-            item.end());
-        if (!item.empty()) {
-            freqs.push_back(std::stod(item));
+    _last_fetch_log = now;
+    std::ostringstream ss;
+    ss << "[bonded_source] " << reason << " requesting " << noutput_items
+       << " samples";
+    if (result != nullptr) {
+        if (!result->error_message.empty()) {
+            ss << "; detail: " << result->error_message;
+        }
+        if (!result->first_timestamps.empty()) {
+            ss << "; first_ts=";
+            for (size_t i = 0; i < result->first_timestamps.size(); i++) {
+                if (i != 0) {
+                    ss << ',';
+                }
+                ss << result->first_timestamps[i];
+            }
+        }
+        if (result->aligned) {
+            ss << "; spread_us=" << result->inter_device_spread_us;
         }
     }
-    return freqs;
+    std::cerr << ss.str() << std::endl;
 }
 
 bonded_source_impl::bonded_source_impl(const std::string& serials_csv,
@@ -98,10 +98,10 @@ bonded_source_impl::bonded_source_impl(const std::string& serials_csv,
                                        const std::string& stream_args)
     : gr::sync_block("bonded_source",
                      gr::io_signature::make(0, 0, 0),
-                     gr::io_signature::makev(
+                     gr::io_signature::make(
                          static_cast<int>(_parse_serials(serials_csv).size() * 2),
                          static_cast<int>(_parse_serials(serials_csv).size() * 2),
-                         _make_output_signature(_parse_serials(serials_csv).size() * 2))),
+                         sizeof(gr_complex))),
       _serials(_parse_serials(serials_csv)),
       _fetch_timeout(fetch_timeout)
 {
@@ -115,16 +115,28 @@ bonded_source_impl::bonded_source_impl(const std::string& serials_csv,
     cfg.subdev = subdev;
     cfg.strict = strict_lock;
     cfg.lock_timeout = lock_timeout;
-    cfg.freq_plan = _parse_freq_plan(freq_plan_csv);
+    cfg.freq_plan = bonded::detail::parse_csv_doubles(freq_plan_csv, "freq_plan_csv");
     cfg.stream_args = stream_args;
     if (!cfg.freq_plan.empty() && cfg.freq_plan.size() != _serials.size()) {
         throw std::invalid_argument(
             "freq_plan_csv length must match number of serials");
     }
     _rx = std::make_unique<bonded::bonded_receiver>(cfg);
+
+    // GNU Radio's default output buffer means a few thousand samples per
+    // work() call at tens of MS/s, and the scheduler handoffs then cap the
+    // throughput with no thread saturated. BONDED_SRC_BUFFER overrides it.
+    long out_buf = 262144;
+    if (const char* env = std::getenv("BONDED_SRC_BUFFER")) {
+        const long v = std::strtol(env, nullptr, 10);
+        if (v > 0) {
+            out_buf = v;
+        }
+    }
+    set_min_output_buffer(out_buf);
 }
 
-bonded_source_impl::~bonded_source_impl() {}
+bonded_source_impl::~bonded_source_impl() = default;
 
 bool bonded_source_impl::start()
 {
@@ -152,22 +164,15 @@ int bonded_source_impl::work(int noutput_items,
     auto result = _rx->get_aligned_samples(static_cast<size_t>(noutput_items), _fetch_timeout);
     const size_t expected_devices = _serials.size();
 
-    auto zero_all_outputs = [&]() {
-        for (auto* out : output_items) {
-            std::memset(out, 0, sizeof(gr_complex) * static_cast<size_t>(noutput_items));
-        }
-    };
-
     if (result.data.size() != expected_devices) {
-        zero_all_outputs();
-        return noutput_items;
+        _log_fetch_issue("aligned fetch returned wrong device count", noutput_items, &result);
+        return 0;
     }
 
     bool shape_ok = true;
     for (size_t d = 0; d < expected_devices; d++) {
-        // bonded_receiver may provide 1 channel/device when a freq plan is
-        // active. We accept 1.._channels_per_device channels and copy what is
-        // available into the corresponding output ports.
+        // A device may provide fewer channels than output ports (e.g. a
+        // single-channel subdev spec); missing ports are filled with zeros.
         const size_t channels_available =
             std::min(result.data[d].size(), _channels_per_device);
         if (channels_available == 0) {
@@ -186,8 +191,20 @@ int bonded_source_impl::work(int noutput_items,
     }
 
     if (!shape_ok) {
-        zero_all_outputs();
-        return noutput_items;
+        _log_fetch_issue("aligned fetch returned incomplete channel shape", noutput_items, &result);
+        return 0;
+    }
+
+    bool degraded = false;
+    for (bool success : result.success) {
+        if (!success) {
+            degraded = true;
+            break;
+        }
+    }
+    if (degraded) {
+        _log_fetch_issue("aligned fetch degraded; not forwarding zero-filled data", noutput_items, &result);
+        return 0;
     }
 
     for (size_t d = 0; d < expected_devices; d++) {
@@ -201,18 +218,12 @@ int bonded_source_impl::work(int noutput_items,
                         sizeof(gr_complex) * static_cast<size_t>(noutput_items));
         }
 
-        // Keep deterministic zeros on fixed output ports that do not have
-        // runtime channel data (e.g., 1 channel/device with freq_plan).
         for (size_t ch = channels_available; ch < _channels_per_device; ch++) {
             const size_t port = d * _channels_per_device + ch;
             auto* out = static_cast<gr_complex*>(output_items[port]);
-            std::memset(out, 0, sizeof(gr_complex) * static_cast<size_t>(noutput_items));
+            std::fill_n(out, static_cast<size_t>(noutput_items), gr_complex{});
         }
     }
-
-    // Per-buffer tagging is expensive at high sample rates and is currently
-    // not consumed by the capture/decoder flowgraphs. Keep disabled to avoid
-    // scheduler pressure and RX overflows.
 
     return noutput_items;
 }

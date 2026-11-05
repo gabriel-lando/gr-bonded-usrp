@@ -6,21 +6,21 @@ templates:
   imports: |-
     from gnuradio import bonded_usrp
   make: |-
-    bonded_usrp.bonded_source(${serials_csv}, ${rate}, ${freq}, ${gain}, ${clock_source}, ${time_source}, ${strict_lock}, ${lock_timeout}, ${fetch_timeout}, ${subdev}, ${freq_plan_csv})
+    bonded_usrp.bonded_source(${serials_csv}, ${rate}, ${freq}, ${gain}, ${clock_source}, ${time_source}, ${strict_lock}, ${lock_timeout}, ${fetch_timeout}, ${subdev}, ${freq_plan_csv}, ${stream_args})
 
 parameters:
   - id: serials_csv
     label: Serials CSV
     dtype: string
-    default: '30B56D6,30DBC3C'
+    default: 'SERIAL_A,SERIAL_B'
   - id: rate
-    label: Rate
+    label: Per-radio Rate (Hz)
     dtype: real
     default: 10e6
   - id: freq
-    label: Frequency
+    label: Center Frequency (Hz)
     dtype: real
-    default: 100e6
+    default: 2.412e9
   - id: gain
     label: Gain (dB)
     dtype: real
@@ -38,11 +38,11 @@ parameters:
     dtype: bool
     default: 'False'
   - id: lock_timeout
-    label: Lock Timeout
+    label: Lock Timeout (s)
     dtype: real
     default: 5.0
   - id: fetch_timeout
-    label: Fetch Timeout
+    label: Fetch Timeout (s)
     dtype: real
     default: 1.0
   - id: subdev
@@ -51,6 +51,10 @@ parameters:
     default: ''
   - id: freq_plan_csv
     label: Freq Plan CSV
+    dtype: string
+    default: ''
+  - id: stream_args
+    label: Stream Args
     dtype: string
     default: ''
 
@@ -69,9 +73,19 @@ outputs:
     dtype: complex
 
 documentation: |-
-  Bonded multi-USRP source backed by uhd::usrp::bonded::bonded_receiver.
+  Bonded USRP source (RX side).
 
-  Notes:
-  - Current block exposes 4 output ports (2 devices x 2 channels).
-  - Use channel 0 of each device for the existing WiFi stitched RX flow.
-  - Optional freq_plan_csv sets per-device center frequencies in Hz.
+  Streams from two B210s that share an external 10 MHz reference and PPS.
+  Both radios are locked to the reference, their clocks are set to a common
+  time on a PPS edge, and samples are aligned by timestamp, so the outputs of
+  the two radios are sample-aligned. A block in which either radio lost
+  samples (overflow) is dropped on both radios, which keeps them aligned.
+
+  Outputs: 2 ports per radio (out0/out1 = radio A ch0/ch1, out2/out3 = radio
+  B ch0/ch1). Use out0 and out2 for the Overlap Reconstructor.
+
+  serials_csv: two B210 serials, radio A (lower slice) first.
+  freq_plan_csv: per-radio centre frequencies (Hz); empty tunes both to freq.
+  stream_args: extra UHD RX stream args (e.g. num_recv_frames=...).
+
+file_format: 1

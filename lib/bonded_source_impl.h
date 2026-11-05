@@ -1,14 +1,13 @@
 #pragma once
 
+#include "bonded_receiver.hpp"
 #include <gnuradio/bonded_usrp/bonded_source.h>
+#include <chrono>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
-
-namespace bonded {
-class bonded_receiver;
-}
 
 namespace gr {
 namespace bonded_usrp {
@@ -40,12 +39,16 @@ public:
 
 private:
     static std::vector<std::string> _parse_serials(const std::string& serials_csv);
-    static std::vector<double> _parse_freq_plan(const std::string& freq_plan_csv);
-    static std::vector<int> _make_output_signature(size_t nports);
 
     std::vector<std::string> _serials;
     size_t _channels_per_device = 2;
     double _fetch_timeout = 1.0;
+
+    std::chrono::steady_clock::time_point _last_fetch_log{};
+
+    void _log_fetch_issue(const std::string& reason,
+                          int noutput_items,
+                          const bonded::bonded_receiver::rx_result* result = nullptr);
 
     bool _running = false;
     std::mutex _state_mutex;

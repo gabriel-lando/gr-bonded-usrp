@@ -2,6 +2,7 @@
 
 #include <gnuradio/bonded_usrp/api.h>
 #include <gnuradio/sync_block.h>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -11,16 +12,20 @@ namespace bonded_usrp {
 /*!
  * \brief Bonded USRP sink block (TX side).
  *
- * Accepts two per-radio complex baseband streams (one per bonded B210) and
- * transmits them simultaneously via the configured TX streamers.  Internally
- * wraps uhd::usrp::bonded::bonded_transmitter, which handles 10 MHz + PPS
- * clock/time synchronisation and a common timed TX start.
+ * Transmits two per-radio complex baseband streams through two B210s that
+ * share an external 10 MHz reference and PPS, sample-aligned on a common
+ * device time.  The radios stream continuously; gaps between input bursts are
+ * filled with zeros so each burst starts at full power, and an underrun on
+ * either radio restarts both on a common time.
  *
- *   in0: Radio A (lower half, tuned at fc + radio1_offset, at rate)
- *   in1: Radio B (upper half, tuned at fc + radio2_offset, at rate)
+ *   in0: radio A (lower half, tuned at fc + radio1_offset, at rate)
+ *   in1: radio B (upper half, tuned at fc + radio2_offset, at rate)
  *
- * Use this block together with bonded_usrp_band_splitter to form the complete
- * TX bonding path:  wifi_phy_hier → band_splitter → bonded_sink → two B210s.
+ * Typical TX chain: wideband baseband -> band_splitter -> bonded_sink.
+ * The device setup runs in the constructor (it takes a few seconds).
+ *
+ * serials_csv must list exactly two serials; the *_csv per-radio parameters
+ * are empty or two comma-separated numbers.  gain is normalized [0, 1].
  */
 class BONDED_USRP_API bonded_sink : virtual public gr::sync_block
 {
@@ -43,6 +48,17 @@ public:
                      const std::string& gain_plan_csv  = "",
                      const std::string& freq_offset_csv  = "",
                      const std::string& phase_offset_csv = "");
+
+    /*!
+     * Set device's (0 = A, 1 = B) phase rotation in radians while running,
+     * e.g. to cancel the arbitrary relative phase of the two halves as
+     * measured at a receiver.
+     */
+    virtual void set_phase_offset(int device, double rad) = 0;
+    virtual double phase_offset(int device) const = 0;
+
+    //! Bursts of input (runs of data between zero-fill) sent so far.
+    virtual uint64_t frames_sent() const = 0;
 };
 
 } // namespace bonded_usrp

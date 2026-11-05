@@ -12,7 +12,7 @@ parameters:
   - id: serials_csv
     label: Serials CSV
     dtype: string
-    default: '30B56D6,30DBC3C'
+    default: 'SERIAL_A,SERIAL_B'
   - id: rate
     label: Per-radio Rate (Hz)
     dtype: real
@@ -22,9 +22,9 @@ parameters:
     dtype: real
     default: 2.412e9
   - id: gain
-    label: TX Gain (dB)
+    label: TX Gain (normalized 0-1)
     dtype: real
-    default: 0.0
+    default: 0.5
   - id: clock_source
     label: Clock Source
     dtype: string
@@ -83,18 +83,29 @@ inputs:
     dtype: complex
 
 documentation: |-
-  Bonded USRP TX sink backed by uhd::usrp::bonded::bonded_transmitter.
+  Bonded USRP sink (TX side).
 
-  Accepts two per-radio complex streams (at rate Hz each) and transmits
-  them simultaneously through two synchronized B210s.  The devices share an
-  external 10 MHz reference + PPS so their TX streams are sample-aligned.
+  Transmits two per-radio complex streams (at rate Hz each) through two B210s
+  that share an external 10 MHz reference and PPS. Both radios are locked to
+  the reference, their clocks are set to a common time on a PPS edge, and both
+  start streaming at the same device time. The radios stream continuously for
+  the whole session: gaps between input bursts are filled with zeros, so each
+  burst starts at full power (a B210 needs several hundred microseconds to ramp
+  up after idle). If either radio underruns, both restart on a common time.
 
-  serials_csv: comma-separated B210 serials (radio A first, radio B second).
-  freq_plan_csv: optional per-device center frequencies (Hz), comma-separated;
-    leave empty to auto-compute from freq ± rate/2.
-  delay_trim_a/b: integer per-device sample-delay trim to correct residual
-    inter-device skew (positive = delay that radio's TX start by N samples).
+  serials_csv: exactly two B210 serials, radio A (lower half) first.
+  gain: normalized TX gain [0, 1]; gain_plan_csv overrides it per radio.
+  freq_plan_csv: per-radio centre frequencies (Hz); empty tunes both to freq.
+  delay_trim_a/b: per-radio delay in samples (positive delays that radio).
+  freq_offset_csv / phase_offset_csv: per-radio digital frequency (Hz) and
+    phase (rad) correction. The phase can also be changed while running with
+    set_phase_offset(device, rad).
 
-  Typical chain: wifi_phy_hier → band_splitter → bonded_sink.
+  The device setup (several seconds) runs when the block is constructed, so
+  nothing upstream can queue a backlog before streaming starts.
+
+  frames_sent() counts the bursts handed to the radios.
+
+  Typical chain: baseband source -> Band Splitter -> Bonded USRP Sink.
 
 file_format: 1
