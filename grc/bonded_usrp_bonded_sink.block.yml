@@ -106,6 +106,7 @@ documentation: |-
 
   frames_sent() counts the bursts handed to the radios.
 
-  Typical chain: baseband source -> Band Splitter -> Bonded USRP Sink.
+  Typical chain: baseband source -> OFDM Splitter (OFDM bursts) or Band
+  Splitter (any signal) -> Bonded USRP Sink.
 
 file_format: 1

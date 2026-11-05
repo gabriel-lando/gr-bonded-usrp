@@ -482,3 +482,29 @@ BOOST_AUTO_TEST_CASE(test_band_splitter_rejects_bad_config)
     c.radio2_offset_hz = 6e6; // a 12 MHz slice cannot fit in 10 MS/s
     BOOST_CHECK_THROW(band_splitter{c}, std::invalid_argument);
 }
+
+BOOST_AUTO_TEST_CASE(test_band_splitter_no_phase_drift)
+{
+    // The per-radio translation must keep its exact frequency: a float
+    // increment drifted ~8 deg/s per radio at 20 MHz (4.375 MHz offsets).
+    const double T = 20e6, off = 4.375e6, f = -6e6;
+    band_splitter_config cfg;
+    cfg.input_rate       = T;
+    cfg.per_radio_rate   = T / 2;
+    cfg.radio1_offset_hz = -off;
+    cfg.radio2_offset_hz = +off;
+    band_splitter spl(cfg);
+    const size_t n = static_cast<size_t>(0.4 * T);
+    const auto x   = bonded_test::tone(f, T, n);
+    std::vector<cf> o1, o2;
+    for (size_t i = 0; i < n; i += 65536) {
+        spl.process(x.data() + i, std::min<size_t>(65536, n - i), o1, o2);
+    }
+    // Radio 1 sees the tone at f - (-off), at T/2.
+    const double fr = f + off, R = T / 2;
+    const size_t w = 20000, early = 10000, late = o1.size() - 2 * w;
+    const double d = std::arg(bonded_test::tone_amplitude(o1, fr, R, late, late + w)
+                              / bonded_test::tone_amplitude(o1, fr, R, early, early + w));
+    BOOST_TEST_MESSAGE("radio 1 tone phase moved " << d * 180 / kPi << " deg");
+    BOOST_CHECK_LT(std::abs(d) * 180 / kPi, 0.2);
+}

@@ -172,3 +172,30 @@ BOOST_AUTO_TEST_CASE(test_poly_resampler_c_slices_match_one_pass)
         off += n;
     }
 }
+
+BOOST_AUTO_TEST_CASE(test_nco_phase_is_exact_over_long_runs)
+{
+    // A float increment advanced sample by sample runs at its rounded
+    // frequency; the nco must instead land on the exact phase after any
+    // number of samples, in any chunking.
+    const double f = -3.75e6, fs = 20e6;
+    nco osc(f, fs);
+    const cf inc = osc.increment();
+    BOOST_CHECK_LT(std::abs(std::arg(inc) - 2.0 * kPi * f / fs), 1e-6);
+    uint64_t n = 0;
+    std::mt19937 rng(5);
+    std::uniform_int_distribution<size_t> chunk(1, 70000);
+    while (n < 400000000ull) { // 20 s at 20 MS/s
+        const size_t k = chunk(rng);
+        osc.advance(k);
+        n += k;
+    }
+    const double expect = std::fmod(f / fs * static_cast<double>(n), 1.0);
+    const cf want(static_cast<float>(std::cos(2 * kPi * expect)),
+        static_cast<float>(std::sin(2 * kPi * expect)));
+    BOOST_CHECK_LT(std::abs(osc.at(0) - want), 1e-5f);
+    // at(k) is the phase k samples ahead.
+    nco a(f, fs), b(f, fs);
+    b.advance(12345);
+    BOOST_CHECK_LT(std::abs(a.at(12345) - b.at(0)), 1e-5f);
+}

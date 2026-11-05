@@ -14,6 +14,7 @@
 #include "bonded_resample.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -194,9 +195,11 @@ struct overlap_reconstructor::impl
 
     overlap_reconstructor_config cfg;
     size_t interp, decim;
-    // Translation phase of each radio at the next output sample; shared by
-    // both paths so the frozen path continues the warmup's phase exactly.
-    cf inc1, inc2, rot1{1, 0}, rot2{1, 0};
+    // Translation of each radio to its place in the target channel, at the
+    // next output sample; shared by both paths so the frozen path continues
+    // the warmup's phase exactly. inc1/inc2 rotate within one call only.
+    nco nco1, nco2;
+    cf inc1, inc2;
 
     poly_resampler rs1, rs2;     // warmup path (real proto + separate rotate/crossfade)
     poly_resampler_c rs1c, rs2c; // frozen path (fused complex polyphase per radio)
@@ -213,6 +216,22 @@ struct overlap_reconstructor::impl
     bool frozen = false;
     size_t processed = 0;
     size_t kWarmup = 200000;
+
+    // Phase tracking on the frozen path (BONDED_TRACK=0 disables). The warmup
+    // may freeze on an overlap holding only noise, whose cross-correlation
+    // has an arbitrary phase; the fused path keeps measuring arg(sum a*b'),
+    // which only the overlap contributes to (a and b share no other
+    // spectrum), and accumulates it over the calls with coherent content
+    // there. The right phase differs per emitter (each radio has its own
+    // antenna; live, a weak continuous source and our frames were 40 deg
+    // apart), so the sum weights each call by its correlation energy squared
+    // and never forgets: it locks onto the strongest signal, which is the one
+    // dense constellations need, and moves less and less. A short memory
+    // would hop between emitters, inside frames.
+    bool tracking = true;
+    cd track_sum{0, 0};
+    double last_logged_phase = 0.0;
+    clock::time_point last_track_log{};
 
     // Reusable scratch buffers (retain capacity across calls).
     std::vector<cf> r1_, r2_, o1_, o2_, out_;
@@ -253,7 +272,11 @@ struct overlap_reconstructor::impl
     // The current call's batch, published before job_seq_ (release).
     struct batch {
         size_t p1 = 0, p2 = 0, mf = 0, direct = 0, slices = 1;
-        cf rotA{1, 0}, rotB{1, 0}, alpha{1, 0};
+        nco ncoA, ncoB;
+        cf alpha{1, 0};
+        // Per-slice sums over the combined range for phase tracking.
+        std::array<cd, 16> sab{};
+        std::array<double, 16> saa{}, sbb{};
     } job_;
 
     //! Spin -> yield -> sleep backoff. `spins` is the caller's iteration count.
@@ -283,20 +306,72 @@ struct overlap_reconstructor::impl
         const size_t e1 = std::min(i1, j.p1), e2 = std::min(i1, j.p2);
         if (i0 < e1) {
             rs1c.compute(a, i0, e1);
-            rotate_tile(a + i0, e1 - i0, j.rotA * inc_pow(inc1, i0), inc1);
+            rotate_tile(a + i0, e1 - i0, j.ncoA.at(i0), inc1);
         }
         if (i0 < e2) {
             rs2c.compute(b, i0, e2);
-            rotate_tile(b + i0, e2 - i0, j.rotB * inc_pow(inc2, i0), inc2);
+            rotate_tile(b + i0, e2 - i0, j.ncoB.at(i0), inc2);
         }
         const size_t c1 = std::min(i1, j.mf);
         const size_t split = std::min(std::max(i0, j.direct), c1);
-        for (size_t i = i0; i < split; i++) {
-            direct_dst_[i] = a[i] + j.alpha * b[i];
+        // Combine, plus (for tracking) sum(a b'), sum|a|^2, sum|b|^2 in the
+        // same pass.
+        float sr = 0.0f, si = 0.0f, pa = 0.0f, pb = 0.0f;
+        auto combine = [&](cf* dst, size_t from, size_t to) {
+            if (!tracking) {
+                for (size_t i = from; i < to; i++) {
+                    dst[i] = a[i] + j.alpha * b[i];
+                }
+                return;
+            }
+            for (size_t i = from; i < to; i++) {
+                const cf av = a[i], bv = b[i];
+                dst[i] = av + j.alpha * bv;
+                sr += av.real() * bv.real() + av.imag() * bv.imag();
+                si += av.imag() * bv.real() - av.real() * bv.imag();
+                pa += av.real() * av.real() + av.imag() * av.imag();
+                pb += bv.real() * bv.real() + bv.imag() * bv.imag();
+            }
+        };
+        combine(direct_dst_, i0, split);
+        combine(out_.data() - j.direct, split, c1);
+        job_.sab[k] = cd(sr, si);
+        job_.saa[k] = pa;
+        job_.sbb[k] = pb;
+    }
+
+    //! Adopts the overlap phase measured on the frozen path when the call's
+    //! overlap content is coherent between the radios. rho = |sum a b'|^2 /
+    //! (sum|a|^2 sum|b|^2) times n is about 0.03 on average for independent
+    //! noise and grows with n for a common signal (about 70 at n = 16384 for
+    //! flat content); 3 rejects noise with a wide margin.
+    void track_phase(size_t n)
+    {
+        cd sab(0, 0);
+        double saa = 0.0, sbb = 0.0;
+        for (size_t k = 0; k < job_.slices; k++) {
+            sab += job_.sab[k];
+            saa += job_.saa[k];
+            sbb += job_.sbb[k];
         }
-        cf* o = out_.data() - j.direct;
-        for (size_t i = split; i < c1; i++) {
-            o[i] = a[i] + j.alpha * b[i];
+        if (n < 2048 || saa <= 0.0 || sbb <= 0.0
+            || std::norm(sab) / (saa * sbb) * static_cast<double>(n) < 3.0) {
+            return;
+        }
+        track_sum += sab * std::abs(sab);
+        const double ph = std::arg(track_sum);
+        alpha = std::polar(static_cast<float>(align.gain), static_cast<float>(ph));
+        align.phase_rad = ph;
+        const auto now  = clock::now();
+        const double moved =
+            std::abs(std::remainder(ph - last_logged_phase, 2.0 * kPi)) * 180.0 / kPi;
+        if (moved > 2.0 && now - last_track_log > std::chrono::seconds(1)) {
+            std::cerr << "[overlap_reconstructor] alignment phase "
+                      << last_logged_phase * 180.0 / kPi << " -> " << ph * 180.0 / kPi
+                      << " deg (tracked; this call " << std::arg(sab) * 180.0 / kPi
+                      << ")" << std::endl;
+            last_logged_phase = ph;
+            last_track_log    = now;
         }
     }
 
@@ -333,6 +408,7 @@ struct overlap_reconstructor::impl
     explicit impl(const overlap_reconstructor_config& c) : cfg(c)
     {
         parallel_enabled = env_flag_enabled_default_on("BONDED_PARALLEL");
+        tracking         = env_flag_enabled_default_on("BONDED_TRACK");
         if (const char* env = std::getenv("BONDED_THREADS")) {
             const long v = std::strtol(env, nullptr, 10);
             if (v >= 1 && v <= 16) {
@@ -397,10 +473,12 @@ struct overlap_reconstructor::impl
         tail1_.assign(hlow.K - 1, cf(0, 0));
         tail2_.assign(hhigh.K - 1, cf(0, 0));
 
+        nco1 = nco(c.radio1_offset_hz, fs);
+        nco2 = nco(c.radio2_offset_hz, fs);
+        inc1 = nco1.increment();
+        inc2 = nco2.increment();
         const double w1 = 2.0 * kPi * c.radio1_offset_hz / fs;
         const double w2 = 2.0 * kPi * c.radio2_offset_hz / fs;
-        inc1 = cf(static_cast<float>(std::cos(w1)), static_cast<float>(std::sin(w1)));
-        inc2 = cf(static_cast<float>(std::cos(w2)), static_cast<float>(std::sin(w2)));
 
         // --- Fused per-radio prototype (frozen/steady-state path) -------------
         // rotate-then-FIR identity: (h * (r·e^{jwn}))[n] = e^{jwn}(h'*r)[n] with
@@ -485,9 +563,9 @@ struct overlap_reconstructor::impl
         last_profile_log = now;
     }
 
-    // x[i] *= start * inc^i (frequency translation). The phase at any index is
-    // closed form, so each slice gets its own start phase (see inc_pow) and
-    // the slices can rotate concurrently.
+    // x[i] *= start * inc^i (frequency translation). The start phase comes
+    // from the exact nco, so each slice gets its own and the slices can rotate
+    // concurrently.
     static void rotate_tile(cf* x, size_t n, cf start, cf inc)
     {
 #ifdef BONDED_HAVE_VOLK
@@ -505,33 +583,6 @@ struct overlap_reconstructor::impl
             if (mg > 0) p /= mg;
         }
 #endif
-    }
-
-    //! inc^k for unit-modulus inc, in closed form: (cos(k*w), sin(k*w)).
-    static cf inc_pow(cf inc, size_t k)
-    {
-        const double w = std::atan2(static_cast<double>(inc.imag()),
-            static_cast<double>(inc.real()));
-        return cf(static_cast<float>(std::cos(w * static_cast<double>(k))),
-            static_cast<float>(std::sin(w * static_cast<double>(k))));
-    }
-
-    //! phase *= inc^N, renormalized.
-    static void advance_phase(cf& phase, cf inc, size_t N)
-    {
-        phase = phase * inc_pow(inc, N);
-        const float mg = std::abs(phase);
-        if (mg > 0) phase /= mg;
-    }
-
-    void rotate(std::vector<cf>& x, cf& phase, cf inc)
-    {
-        const size_t N = x.size();
-        if (N == 0) {
-            return;
-        }
-        rotate_tile(x.data(), N, phase, inc);
-        advance_phase(phase, inc, N);
     }
 
     const std::vector<cf>& process(const cf* rx1, const cf* rx2, size_t n)
@@ -559,8 +610,8 @@ struct overlap_reconstructor::impl
                 (direct_dst_ != nullptr) ? std::min(job_.mf, direct_cap_) : 0;
             direct_written_ = job_.direct;
             out_.resize(job_.mf - job_.direct);
-            job_.rotA  = rot1;
-            job_.rotB  = rot2;
+            job_.ncoA  = nco1;
+            job_.ncoB  = nco2;
             job_.alpha = alpha;
             // Only hand off when the call is big enough to amortize the
             // handoff; tiny calls stay serial.
@@ -582,8 +633,11 @@ struct overlap_reconstructor::impl
             }
             rs1c.commit();
             rs2c.commit();
-            advance_phase(rot1, inc1, job_.p1);
-            advance_phase(rot2, inc2, job_.p2);
+            nco1.advance(job_.p1);
+            nco2.advance(job_.p2);
+            if (tracking) {
+                track_phase(job_.mf);
+            }
             if (profile_enabled) {
                 profile_stats.resample += clock::now() - resample_start_f;
                 profile_stats.total += clock::now() - total_start;
@@ -622,8 +676,10 @@ struct overlap_reconstructor::impl
 
         // Frequency-translate each radio to the target baseband.
         const auto rotate_start = profile_enabled ? clock::now() : clock::time_point{};
-        rotate(r1_, rot1, inc1);
-        rotate(r2_, rot2, inc2);
+        rotate_tile(r1_.data(), m, nco1.at(0), inc1);
+        rotate_tile(r2_.data(), m, nco2.at(0), inc2);
+        nco1.advance(m);
+        nco2.advance(m);
         if (profile_enabled) {
             profile_stats.rotate += clock::now() - rotate_start;
         }
@@ -652,6 +708,15 @@ struct overlap_reconstructor::impl
         processed += m;
         if (processed >= kWarmup && Sbb > 0.0) {
             frozen = true;
+            // Coherence of the two radios over the overlap: near 1 for a
+            // common signal, near 0 when the warmup saw only noise (the
+            // tracking above then corrects the phase on the first frames).
+            const double coh = std::norm(Sxy) / (Saa * Sbb);
+            std::cerr << "[overlap_reconstructor] alignment frozen: gain "
+                      << align.gain << ", phase " << align.phase_rad * 180.0 / kPi
+                      << " deg, coherence " << coh << std::endl;
+            last_logged_phase = align.phase_rad;
+            last_track_log    = clock::now();
         }
         if (profile_enabled) {
             profile_stats.align += clock::now() - align_start;

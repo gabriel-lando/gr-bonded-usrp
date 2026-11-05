@@ -161,71 +161,83 @@ int bonded_source_impl::work(int noutput_items,
                              gr_vector_const_void_star&,
                              gr_vector_void_star& output_items)
 {
-    auto result = _rx->get_aligned_samples(static_cast<size_t>(noutput_items), _fetch_timeout);
     const size_t expected_devices = _serials.size();
+    const auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::duration<double>(_fetch_timeout);
+    // A degraded block (a hole on some device) has been consumed; fetch the
+    // next one right away. Returning 0 instead would leave the block idle
+    // until the scheduler retries a source that produced nothing, about twice
+    // a second: too rarely to drain rings that are full, which would then
+    // keep every fetch degraded for the rest of the session.
+    for (;;) {
+        auto result = _rx->get_aligned_samples(static_cast<size_t>(noutput_items), _fetch_timeout);
 
-    if (result.data.size() != expected_devices) {
-        _log_fetch_issue("aligned fetch returned wrong device count", noutput_items, &result);
-        return 0;
-    }
-
-    bool shape_ok = true;
-    for (size_t d = 0; d < expected_devices; d++) {
-        // A device may provide fewer channels than output ports (e.g. a
-        // single-channel subdev spec); missing ports are filled with zeros.
-        const size_t channels_available =
-            std::min(result.data[d].size(), _channels_per_device);
-        if (channels_available == 0) {
-            shape_ok = false;
-            break;
+        if (result.data.size() != expected_devices) {
+            _log_fetch_issue("aligned fetch returned wrong device count", noutput_items, &result);
+            return 0;
         }
-        for (size_t ch = 0; ch < channels_available; ch++) {
-            if (result.data[d][ch].size() != static_cast<size_t>(noutput_items)) {
+
+        bool shape_ok = true;
+        for (size_t d = 0; d < expected_devices; d++) {
+            // A device may provide fewer channels than output ports (e.g. a
+            // single-channel subdev spec); missing ports are filled with zeros.
+            const size_t channels_available =
+                std::min(result.data[d].size(), _channels_per_device);
+            if (channels_available == 0) {
                 shape_ok = false;
                 break;
             }
+            for (size_t ch = 0; ch < channels_available; ch++) {
+                if (result.data[d][ch].size() != static_cast<size_t>(noutput_items)) {
+                    shape_ok = false;
+                    break;
+                }
+            }
+            if (!shape_ok) {
+                break;
+            }
         }
+
         if (!shape_ok) {
-            break;
-        }
-    }
-
-    if (!shape_ok) {
-        _log_fetch_issue("aligned fetch returned incomplete channel shape", noutput_items, &result);
-        return 0;
-    }
-
-    bool degraded = false;
-    for (bool success : result.success) {
-        if (!success) {
-            degraded = true;
-            break;
-        }
-    }
-    if (degraded) {
-        _log_fetch_issue("aligned fetch degraded; not forwarding zero-filled data", noutput_items, &result);
-        return 0;
-    }
-
-    for (size_t d = 0; d < expected_devices; d++) {
-        const size_t channels_available =
-            std::min(result.data[d].size(), _channels_per_device);
-        for (size_t ch = 0; ch < channels_available; ch++) {
-            const size_t port = d * _channels_per_device + ch;
-            auto* out = static_cast<gr_complex*>(output_items[port]);
-            std::memcpy(out,
-                        result.data[d][ch].data(),
-                        sizeof(gr_complex) * static_cast<size_t>(noutput_items));
+            _log_fetch_issue("aligned fetch returned incomplete channel shape", noutput_items, &result);
+            return 0;
         }
 
-        for (size_t ch = channels_available; ch < _channels_per_device; ch++) {
-            const size_t port = d * _channels_per_device + ch;
-            auto* out = static_cast<gr_complex*>(output_items[port]);
-            std::fill_n(out, static_cast<size_t>(noutput_items), gr_complex{});
+        bool degraded = false;
+        for (bool success : result.success) {
+            if (!success) {
+                degraded = true;
+                break;
+            }
         }
-    }
+        if (degraded) {
+            _log_fetch_issue("aligned fetch degraded; not forwarding zero-filled data", noutput_items, &result);
+            if (std::chrono::steady_clock::now() < deadline) {
+                continue;
+            }
+            return 0;
+        }
 
-    return noutput_items;
+        for (size_t d = 0; d < expected_devices; d++) {
+            const size_t channels_available =
+                std::min(result.data[d].size(), _channels_per_device);
+            for (size_t ch = 0; ch < channels_available; ch++) {
+                const size_t port = d * _channels_per_device + ch;
+                auto* out = static_cast<gr_complex*>(output_items[port]);
+                std::memcpy(out,
+                            result.data[d][ch].data(),
+                            sizeof(gr_complex) * static_cast<size_t>(noutput_items));
+            }
+
+            for (size_t ch = channels_available; ch < _channels_per_device; ch++) {
+                const size_t port = d * _channels_per_device + ch;
+                auto* out = static_cast<gr_complex*>(output_items[port]);
+                std::fill_n(out, static_cast<size_t>(noutput_items), gr_complex{});
+            }
+        }
+
+        return noutput_items;
+    }
 }
 
 } // namespace bonded_usrp

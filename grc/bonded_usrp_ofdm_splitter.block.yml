@@ -1,0 +1,76 @@
+id: bonded_usrp_ofdm_splitter
+label: OFDM Splitter
+category: '[bonded_usrp]'
+
+templates:
+  imports: |-
+    from gnuradio import bonded_usrp
+  make: |-
+    bonded_usrp.ofdm_splitter(${rate_in}, ${rate_out}, ${radio1_offset}, ${radio2_offset}, ${fft_len}, ${cp_len}, ${window_len}, ${len_tag_key})
+
+parameters:
+  - id: rate_in
+    label: Wideband Rate (Hz)
+    dtype: real
+    default: 20e6
+  - id: rate_out
+    label: Per-radio Rate (Hz)
+    dtype: real
+    default: 12.5e6
+  - id: radio1_offset
+    label: Radio1 Offset (Hz)
+    dtype: real
+    default: -3.75e6
+  - id: radio2_offset
+    label: Radio2 Offset (Hz)
+    dtype: real
+    default: 3.75e6
+  - id: fft_len
+    label: FFT Length
+    dtype: int
+    default: 64
+  - id: cp_len
+    label: CP Length
+    dtype: int
+    default: 16
+  - id: window_len
+    label: Window Length
+    dtype: int
+    default: 8
+  - id: len_tag_key
+    label: Length Tag Key
+    dtype: string
+    default: packet_len
+
+inputs:
+  - label: wideband
+    domain: stream
+    dtype: complex
+
+outputs:
+  - label: radio1
+    domain: stream
+    dtype: complex
+  - label: radio2
+    domain: stream
+    dtype: complex
+
+documentation: |-
+  TX split of CP-OFDM bursts in the subcarrier domain (use it instead of Band
+  Splitter for OFDM).
+  Each burst must start at a length tag (Length Tag Key; gr-ieee802-11 and
+  gr-digital OFDM transmitters emit packet_len) and consist of back-to-back
+  symbols of FFT Length + CP Length samples. Every symbol is re-synthesized
+  per radio at the per-radio rate with only that radio's subcarriers (radio1
+  the lower half, radio2 the upper half, the subcarrier midway between the
+  radio centres shared), so each radio transmits a complete OFDM signal and
+  the halves stay orthogonal at the receiver whatever the radios' relative
+  phase. Window Length is a raised-cosine overlap between symbols, in input
+  samples; it confines each radio's spectrum and must not exceed CP Length.
+  The radio offsets are each radio's centre minus fc and must be whole
+  subcarriers (rate_in / FFT Length); FFT and CP lengths must be whole
+  numbers of samples at the per-radio rate. Input outside bursts is sent as
+  silence. The default is the 20 MHz 802.11 plan: 12.5 MS/s per radio at
+  fc -/+ 3.75 MHz.
+
+file_format: 1

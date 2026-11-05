@@ -24,7 +24,7 @@
 namespace bonded {
 
 namespace {
-using namespace detail; // cf, kPi, poly_resampler
+using namespace detail; // cf, nco, poly_resampler
 } // namespace
 
 struct band_splitter::impl
@@ -32,10 +32,10 @@ struct band_splitter::impl
     band_splitter_config cfg;
     size_t interp, decim;
 
-    // NCO state: unit-phasor (phase accumulator) and per-sample increment.
+    // Translation of each copy (exact phase across calls) and its float
+    // per-sample increment.
+    nco nco1, nco2;
     cf inc1, inc2;
-    cf rot1{1.0f, 0.0f};
-    cf rot2{1.0f, 0.0f};
 
     poly_resampler rs1, rs2;
 
@@ -56,18 +56,15 @@ struct band_splitter::impl
         rs2.init(interp, decim, c.taps_per_phase, std::abs(c.radio2_offset_hz) / up);
 
         // Negate offset: shift the radio's slice UP to DC.
-        const double w1 =
-            -2.0 * kPi * c.radio1_offset_hz / c.input_rate;
-        const double w2 =
-            -2.0 * kPi * c.radio2_offset_hz / c.input_rate;
-        inc1 = cf(static_cast<float>(std::cos(w1)),
-            static_cast<float>(std::sin(w1)));
-        inc2 = cf(static_cast<float>(std::cos(w2)),
-            static_cast<float>(std::sin(w2)));
+        nco1 = nco(-c.radio1_offset_hz, c.input_rate);
+        nco2 = nco(-c.radio2_offset_hz, c.input_rate);
+        inc1 = nco1.increment();
+        inc2 = nco2.increment();
     }
 
-    void rotate(std::vector<cf>& x, cf& phase, cf inc)
+    static void rotate(std::vector<cf>& x, nco& osc, cf inc)
     {
+        cf phase = osc.at(0);
 #ifdef BONDED_HAVE_VOLK
         volk_32fc_s32fc_x2_rotator2_32fc(
             reinterpret_cast<lv_32fc_t*>(x.data()),
@@ -80,11 +77,8 @@ struct band_splitter::impl
             v *= phase;
             phase *= inc;
         }
-        const float mag = std::abs(phase);
-        if (mag > 0.f) {
-            phase /= mag;
-        }
 #endif
+        osc.advance(x.size());
     }
 
     void process(const cf* in,
@@ -97,8 +91,8 @@ struct band_splitter::impl
         tmp2_.assign(in, in + n);
 
         // 1) NCO: translate each copy so its radio's slice is at DC.
-        rotate(tmp1_, rot1, inc1);
-        rotate(tmp2_, rot2, inc2);
+        rotate(tmp1_, nco1, inc1);
+        rotate(tmp2_, nco2, inc2);
 
         // 2) Polyphase decimate; the built-in AA filter is the split filter.
         rs1.feed(tmp1_.data(), n, out1);

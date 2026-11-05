@@ -3,11 +3,12 @@
 add_definitions(-DBOOST_TEST_DYN_LINK -DBOOST_TEST_MAIN)
 
 list(APPEND bonded_tests
-    overlap_reconstructor_test   # alignment, flatness, seam, frozen path, threads, direct output
-    bonded_resample_test         # filter design, dot kernels, polyphase resamplers
+    overlap_reconstructor_test   # alignment, flatness, seam, frozen path, threads, direct output, drift
+    bonded_resample_test         # filter design, dot kernels, polyphase resamplers, nco
     bonded_receiver_test         # timestamp alignment of the receive rings
     bonded_transmitter_test      # config checks, phase API, frequency/phase correction
-    band_splitter_test           # TX split: flatness, half assignment, seam width, streaming
+    band_splitter_test           # TX split: flatness, half assignment, seam width, streaming, drift
+    ofdm_splitter_test           # OFDM TX split: any relative phase, subcarrier assignment, timeline
     bonded_csv_test)             # block CSV parameters
 
 foreach(test_name ${bonded_tests})

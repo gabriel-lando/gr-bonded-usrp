@@ -21,7 +21,8 @@ namespace bonded_usrp {
  *   in0: radio A (lower half, tuned at fc + radio1_offset, at rate)
  *   in1: radio B (upper half, tuned at fc + radio2_offset, at rate)
  *
- * Typical TX chain: wideband baseband -> band_splitter -> bonded_sink.
+ * Typical TX chain: wideband baseband -> ofdm_splitter (OFDM bursts) or
+ * band_splitter (any signal) -> bonded_sink.
  * The device setup runs in the constructor (it takes a few seconds).
  *
  * serials_csv must list exactly two serials; the *_csv per-radio parameters

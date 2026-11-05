@@ -8,7 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 list(INSERT CMAKE_MODULE_PATH 0 ${PROJECT_SOURCE_DIR}/cmake/Modules)
 
-find_package(Gnuradio "3.10" REQUIRED COMPONENTS runtime)
+find_package(Gnuradio "3.10" REQUIRED COMPONENTS runtime fft)
 find_package(UHD REQUIRED)
 
 # Boost.Test for the hardware-free unit tests (optional).

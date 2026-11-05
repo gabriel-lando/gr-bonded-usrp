@@ -29,11 +29,15 @@ overlap, and discards whatever falls outside the channel.
 
 During a short warmup the block estimates radio B's gain and phase relative to
 radio A from the overlap. The gain is a power ratio and the phase comes from
-the cross-correlation. After the warmup the estimate is frozen (the shared
-reference keeps it constant) and the block switches to a fused path: one
-complex polyphase filter per radio, with the output split across threads. The
-output is phase-preserving complex baseband that a standard receiver can
-decode, for example an 802.11 OFDM receiver.
+the cross-correlation. After the warmup the block switches to a fused path:
+one complex polyphase filter per radio, with the output split across threads.
+The shared reference keeps the alignment constant, but the fused path keeps
+measuring the phase whenever the overlap holds a signal both radios see, so a
+warmup that saw only noise is corrected on the first frames. Because each
+radio has its own antenna, the exact phase differs slightly from emitter to
+emitter; the tracking settles on the strongest signal. The output is
+phase-preserving complex baseband that a standard receiver can decode, for
+example an 802.11 OFDM receiver.
 
 `bonded_source` streams both radios and aligns their samples by device
 timestamp. If one radio drops samples (overflow), the block is dropped on
@@ -55,24 +59,34 @@ practical choice. Smaller overlaps need longer filters.
 ### Transmit: hard split at the centre
 
 ```
- wideband baseband --> band_splitter --> radio A (fc - offset) -.
-                                    \--> radio B (fc + offset) --> bonded_sink
+ wideband baseband --> ofdm_splitter --> radio A (fc - offset) -.
+                     (or band_splitter) \--> radio B (fc + offset) --> bonded_sink
 ```
 
-`band_splitter` cuts the wideband signal in two at `fc`. Each half is shifted
-to DC and resampled through a lowpass of half-width |offset|, so the −6 dB
-points of both filters meet at the centre. For OFDM signals with an unused DC
-subcarrier, such as 802.11, the cut falls on that empty subcarrier. A standard
-receiver's per-subcarrier channel estimate absorbs each radio's own gain,
-phase and delay, so the transmitter needs no phase calibration.
+Each radio transmits one half of the channel: radio A the lower half, radio B
+the upper half. The radios are not phase-coherent, so the receiver sees each
+half with its own gain, phase and delay. A standard OFDM receiver's
+per-subcarrier channel estimate absorbs that, as long as every subcarrier is
+radiated by one radio only and the two halves stay orthogonal. No phase
+calibration is needed.
 
-Only the few subcarriers inside the split filter's transition are radiated by
-both radios. They can fade, depending on the relative phase. `taps_per_phase`
-(default 64) keeps that zone within ±1 subcarrier of 802.11. If the relative
-phase is near 180°, the subcarriers next to the seam get some ISI. That only
-matters for dense constellations (64-QAM). The phase can be changed while
-running (`set_phase_offset`) to bring it near 0°, for example from a receiver's
-measurement.
+`ofdm_splitter` (for OFDM, recommended) splits every OFDM symbol in the
+subcarrier domain. It takes the FFT of the symbol, gives each radio the
+subcarriers of its half, and synthesizes them directly at the radio's rate
+with their own cyclic prefix. Each radio therefore sends a complete CP-OFDM
+signal, and the receiver's FFT separates the two exactly, whatever their
+relative phase. Consecutive symbols overlap by a short raised-cosine window,
+which keeps each radio's spectrum compact. The block needs to know where the
+bursts start: a length tag (`packet_len` from gr-ieee802-11 or gr-digital OFDM
+transmitters) on the first sample of each burst.
+
+`band_splitter` (generic) cuts the wideband signal at `fc` with a sharp
+filter: each half is shifted to DC and resampled through a lowpass of
+half-width |offset|. It works for any signal, but its filter is much longer
+than an OFDM cyclic prefix. When the two radios arrive with a relative phase
+near 180°, the subcarriers next to the seam get inter-symbol interference.
+BPSK to 16-QAM do not mind; 64-QAM fails unless the phase is brought near 0°
+(`set_phase_offset` on the sink, from a receiver's measurement).
 
 `bonded_sink` streams both radios **continuously** for the whole session. A
 B210 needs several hundred microseconds to ramp its TX power after idling,
@@ -82,10 +96,22 @@ hands the same sample sequence to one sender thread per radio, both starting
 at the same device time. If either radio underruns, both restart on a new
 common time.
 
-Recommended TX plan for 802.11 with a channel of width `T`: per-radio rate
-`T/2`, radio offsets `∓ 14/64 · T`. Each radio then carries the 26 used
-subcarriers of its side, and the seam stays away from the edge of each radio's
-own band, where its DUC rolls off. `∓ T/4` also works.
+Recommended TX plans for 802.11 with a channel of width `T`:
+
+| splitter | per-radio rate | radio offsets | example, T = 20 MHz |
+|---|---|---|---|
+| `ofdm_splitter` | `5/8 · T` | `∓ 12/64 · T` (12 subcarriers) | 12.5 MS/s at fc ∓ 3.75 MHz |
+| `band_splitter` | `T/2` | `∓ 14/64 · T` | 10 MS/s at fc ∓ 4.375 MHz |
+
+The `ofdm_splitter` plan is the RX plan: each radio covers its 26 subcarriers
+with room for the window to spill a few subcarriers past the seam. `T/2` at
+`∓ 13/64 · T` also works with it, with less margin at the radios' band
+edges. The `band_splitter` plan keeps the seam away from the edge of each
+radio's band, where its DUC rolls off.
+
+Drive level: the radios' DACs clip at full scale (|x| = 1) and OFDM has a high
+peak-to-average ratio. Keep each radio's RMS around 0.3 or below and use the
+TX gain for power; clipping shows up first as 64-QAM losses.
 
 ## Blocks
 
@@ -137,6 +163,28 @@ bonded_usrp.band_splitter(rate_in, rate_out, radio1_offset, radio2_offset,
 
 Input: the wideband signal at `rate_in`. Outputs: radio A, radio B (at
 `rate_out`). Requires `2·|offset| ≤ rate_out`.
+
+### `ofdm_splitter` (TX, OFDM)
+
+```python
+bonded_usrp.ofdm_splitter(rate_in, rate_out, radio1_offset, radio2_offset,
+    fft_len=64, cp_len=16, window_len=8, len_tag_key="packet_len")
+```
+
+Input: CP-OFDM bursts at `rate_in`, each starting at a `len_tag_key` length
+tag, made of back-to-back symbols of `fft_len + cp_len` samples (a trailing
+partial symbol is ignored; gr-ieee802-11 frames end with one extra sample).
+Outputs: radio A (the subcarriers below the midpoint between the radio
+centres), radio B (those above; a subcarrier exactly on the midpoint is
+shared). Input outside bursts becomes silence on the same timeline.
+
+| parameter | meaning |
+|---|---|
+| `rate_in`, `rate_out` | wideband and per-radio rates; `fft_len` and `cp_len` must be whole numbers of samples at `rate_out` |
+| `radio1_offset`, `radio2_offset` | radio centres minus `fc`, whole subcarriers (`rate_in / fft_len`), radio 1 below radio 2 |
+| `window_len` | raised-cosine overlap between symbols, in input samples, at most `cp_len`. The receiver's FFT window must start at least this far into the cyclic prefix; 8 of 16 leaves the other half for the channel and timing |
+
+For the plan above: `(20e6, 12.5e6, -3.75e6, 3.75e6)`.
 
 ### `bonded_sink` (TX)
 
@@ -200,6 +248,16 @@ tx.connect((spl, 1), (snk, 1))
 tx.run()  # returns once the whole file has been transmitted
 ```
 
+For OFDM bursts carrying length tags (for example straight from a
+gr-ieee802-11 transmitter), use the subcarrier split instead:
+
+```python
+off_tx = 12 / 64 * T
+spl = bonded_usrp.ofdm_splitter(T, 5 / 8 * T, -off_tx, off_tx)
+snk = bonded_usrp.bonded_sink("SERIAL_C,SERIAL_D", 5 / 8 * T, fc, 0.7,
+                              freq_plan_csv=f"{fc - off_tx},{fc + off_tx}")
+```
+
 ## Requirements
 
 - Two (per direction) Ettus B210, all sharing one external 10 MHz reference and
@@ -208,6 +266,8 @@ tx.run()  # returns once the whole file has been transmitted
 - UHD 4.x with development headers (`UHDConfig.cmake`). Tested with 4.10.
 - GNU Radio 3.10 with development headers and pybind11. Tested with 3.10.12.
 - CMake ≥ 3.16 and a C++17 compiler.
+- GNU Radio's FFT component (`gnuradio-fft`, part of a normal GNU Radio
+  install) for `ofdm_splitter`.
 - Optional: VOLK (normally installed with GNU Radio) for the NCO rotators and
   some dot products; Boost.Test for the C++ unit tests; numpy for the Python
   tests.
@@ -244,13 +304,14 @@ Python flowgraphs again: a stale binding usually crashes with
 
 | test | covers |
 |---|---|
-| `overlap_reconstructor_test` | gain and phase recovery, band flatness including the seam, both frequency plans, warmup and frozen paths (and that the frozen path continues the warmup timeline), streaming, thread count invariance, direct-output API, config checks |
-| `bonded_resample_test` | filter design, dot-product kernels, streaming polyphase resamplers, sliced computation |
+| `overlap_reconstructor_test` | gain and phase recovery, band flatness including the seam, both frequency plans, warmup and frozen paths (and that the frozen path continues the warmup timeline), phase tracking after a noise-only warmup and its immunity to noise, no phase drift over a long run, streaming, thread count invariance, direct-output API, config checks |
+| `bonded_resample_test` | filter design, dot-product kernels, streaming polyphase resamplers, sliced computation, oscillator phase over long runs |
 | `bonded_receiver_test` | timestamp alignment of the receive rings: stale data, holes after an overflow, multi-channel, two-device alignment, bookkeeping |
 | `bonded_transmitter_test` | configuration checks, phase-offset API, frequency/phase correction across chunks |
-| `band_splitter_test` | flatness, half assignment, seam width, pulled-in plan, streaming vs one-shot, output length, config checks |
+| `band_splitter_test` | flatness, half assignment, seam width, pulled-in plan, streaming vs one-shot, output length, no phase drift, config checks |
+| `ofdm_splitter_test` | every subcarrier recovered at any relative phase of the radios (both plans), subcarrier assignment, radio-rate timeline and burst release, chunked vs one-call streaming, config checks |
 | `bonded_csv_test` | parsing of the comma-separated block parameters |
-| `qa_band_splitter`, `qa_overlap_reconstructor` | the GNU Radio blocks in flowgraphs (Python) |
+| `qa_band_splitter`, `qa_ofdm_splitter`, `qa_overlap_reconstructor` | the GNU Radio blocks in flowgraphs (Python) |
 
 Device setup, streaming and the over-the-air behaviour require radios and are
 not covered by `ctest`.
@@ -267,6 +328,7 @@ rebuild.
 | `BONDED_CHUNK` | 8192 | reconstructor output multiple; its output buffer is 8× this |
 | `BONDED_SRC_BUFFER` | 262144 | `bonded_source` output buffer (items); lowering it costs throughput |
 | `BONDED_DIRECT_OUT=0` | on | reconstructor copies through an internal buffer instead of writing into the output buffer (for comparisons) |
+| `BONDED_TRACK=0` | on | reconstructor keeps the warmup's phase instead of tracking it on the fused path |
 | `BONDED_PROFILE=1` | off | reconstructor profile once per second on stderr |
 | `BONDED_RX_PROFILE=1` | off | acquisition profile once per second on stderr |
 
@@ -287,6 +349,19 @@ To diagnose a throughput problem:
   it is compute-bound. Well below 100 % while `in_msps` is under the per-radio
   rate means it is starved by the source.
 
+The reconstructor also reports its alignment on stderr, once at the end of
+the warmup and whenever tracking moves the phase by more than 2° (at most
+once per second):
+
+```text
+[overlap_reconstructor] alignment frozen: gain G, phase P deg, coherence C
+[overlap_reconstructor] alignment phase P1 -> P2 deg (tracked; this call P3)
+```
+
+A coherence near 1 means the warmup saw a signal common to both radios; near
+0 means it saw only noise, and the first frames through the overlap will
+correct the phase.
+
 Set the CPU frequency governor to `performance` for high bandwidths.
 
 ## Measured capacity
@@ -298,13 +373,15 @@ On a Ryzen 7 5700G (8 cores), with the frequency plans above:
 | RX, reconstruction only | 80 MHz real time (64 MHz with margin) |
 | RX with a GNU Radio 802.11 receiver attached | 40 MHz decoding at parity with a single-radio receiver |
 | TX, bonded, 802.11 frames | 20, 40 and 60 MHz without underruns |
+| 64-QAM 3/4 through a bonded TX and a bonded RX (`ofdm_splitter`) | 97–100 % of the frames at 20 and 40 MHz; ~85 % at 60 MHz, where the same TX power is spread over three times the bandwidth |
 
 ## Source layout
 
 | path | content |
 |---|---|
 | `lib/overlap_reconstructor.{hpp,cpp}` | RX reconstruction engine |
-| `lib/band_splitter.{hpp,cpp}` | TX split engine |
+| `lib/ofdm_splitter.{hpp,cpp}` | TX split engine for OFDM (subcarrier domain) |
+| `lib/band_splitter.{hpp,cpp}` | TX split engine (filter) |
 | `lib/bonded_resample.hpp` | polyphase resamplers, filter design, dot kernels |
 | `lib/bonded_receiver.{hpp,cpp}` | synchronized multi-radio receive (rings, alignment) |
 | `lib/bonded_alignment.hpp` | timestamp alignment of the receive rings |

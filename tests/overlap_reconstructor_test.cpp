@@ -590,6 +590,9 @@ BOOST_AUTO_TEST_CASE(test_overlap_frozen_path_continues_warmup_path)
         cfg.radio1_offset_hz = -p.offset;
         cfg.radio2_offset_hz = +p.offset;
         cfg.warmup_samples   = 1u << 30; // never freezes: warmup path only
+        // Phase tracking would refine the alignment after the freeze; this
+        // test is about the timeline only.
+        scoped_env no_track("BONDED_TRACK", "0");
         overlap_reconstructor ref_recon(cfg);
         const std::vector<size_t> chunks = {3000, 4096, 1111};
         const std::vector<cf> ref = stream_through(ref_recon, rx1, rx2, chunks);
@@ -612,4 +615,169 @@ BOOST_AUTO_TEST_CASE(test_overlap_frozen_path_continues_warmup_path)
             BOOST_CHECK_LT(err / energy, 1e-6);
         }
     }
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_reconstruct_no_phase_drift)
+{
+    // Each radio's translation must keep its exact frequency for the whole
+    // session. With float phase increments radio 1 drifted ~6 deg/s at
+    // 20 MHz and radio 2 the same the other way, so a frozen alignment
+    // walked off (the RX pair's "phase drift" seen live).
+    const double T = 20e6, R = 12.5e6, c1 = -3.75e6, c2 = +3.75e6;
+    const size_t n = static_cast<size_t>(0.4 * R);
+    // Ideal coherent radios: a tone at 0 Hz seen by both (for the
+    // alignment), one only radio 1 sees and one only radio 2 sees.
+    std::vector<cf> rx1 = bonded_test::tone(0.0 - c1, R, n, 0.0, 0.3);
+    std::vector<cf> rx2 = bonded_test::tone(0.0 - c2, R, n, 0.0, 0.3);
+    const auto t1 = bonded_test::tone(-6e6 - c1, R, n, 0.0, 0.3);
+    const auto t2 = bonded_test::tone(+6e6 - c2, R, n, 0.0, 0.3);
+    for (size_t i = 0; i < n; i++) {
+        rx1[i] += t1[i];
+        rx2[i] += t2[i];
+    }
+    overlap_reconstructor_config cfg;
+    cfg.per_radio_rate   = R;
+    cfg.radio1_offset_hz = c1;
+    cfg.radio2_offset_hz = c2;
+    cfg.warmup_samples   = 20000;
+    overlap_reconstructor recon(cfg);
+    const std::vector<cf> out = stream_through(recon, rx1, rx2, {32768, 20000});
+    BOOST_REQUIRE(recon.alignment().valid);
+    const size_t w = 20000, early = 100000, late = out.size() - 2 * w;
+    for (double f : {-6e6, 6e6}) {
+        const double d = std::arg(tone_amp(out, T, f, late, late + w)
+                                  / tone_amp(out, T, f, early, early + w));
+        BOOST_TEST_MESSAGE("tone " << f / 1e6 << " MHz: phase moved "
+                                   << d * 180 / kPi << " deg over "
+                                   << (late - early) / T << " s");
+        BOOST_CHECK_LT(std::abs(d) * 180 / kPi, 0.2);
+    }
+}
+
+namespace {
+// Radio inputs for the edge-aligned plan: per radio, `noise_n` wideband
+// samples of noise of its own (no common content), then `sig_n` samples of a
+// common symmetric multitone; radio 2 is rotated by -theta, so the right
+// alignment phase is theta.
+std::pair<std::vector<cf>, std::vector<cf>> noise_then_common(
+    size_t noise_n, size_t sig_n, double theta, bool noise_after = false)
+{
+    const double T = 20e6;
+    std::vector<cf> sig(sig_n, cf(0, 0));
+    const std::vector<double> tones = {-8e6, -5e6, -1.5e6, -0.4e6, 0.4e6, 1.5e6, 5e6, 8e6};
+    for (size_t t = 0; t < tones.size(); t++) {
+        const auto x = bonded_test::tone(tones[t], T, sig_n, 0.9 * static_cast<double>(t), 0.3);
+        for (size_t i = 0; i < sig_n; i++) sig[i] += x[i];
+    }
+    std::mt19937 rng(77);
+    std::normal_distribution<float> g(0.0f, 0.3f);
+    auto noisy = [&](const std::vector<cf>& common) {
+        std::vector<cf> noise(noise_n);
+        for (auto& v : noise) v = cf(g(rng), g(rng));
+        std::vector<cf> w = noise_after ? common : noise;
+        const auto& tail  = noise_after ? noise : common;
+        w.insert(w.end(), tail.begin(), tail.end());
+        return w;
+    };
+    std::vector<cf> rx1 = make_slice(noisy(sig), T, -3.75e6, 5, 8);
+    std::vector<cf> rx2 = make_slice(noisy(sig), T, +3.75e6, 5, 8);
+    const cf rot(static_cast<float>(std::cos(theta)), static_cast<float>(-std::sin(theta)));
+    for (auto& v : rx2) v *= rot;
+    return {rx1, rx2};
+}
+
+overlap_reconstructor_config edge_cfg()
+{
+    overlap_reconstructor_config cfg;
+    cfg.per_radio_rate   = 12.5e6;
+    cfg.radio1_offset_hz = -3.75e6;
+    cfg.radio2_offset_hz = +3.75e6;
+    cfg.warmup_samples   = 20000;
+    return cfg;
+}
+
+//! Alignment phase a coherent warmup finds for the same content: the target
+//! (the test radios add a fixed phase of their own to theta).
+double coherent_phase(double theta)
+{
+    scoped_env no_track("BONDED_TRACK", "0");
+    const auto rx = noise_then_common(0, 200000, theta);
+    overlap_reconstructor recon(edge_cfg());
+    (void)stream_through(recon, rx.first, rx.second, {8192});
+    return recon.alignment().phase_rad;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(test_overlap_tracks_phase_after_noise_warmup)
+{
+    // The warmup sees only uncorrelated noise in the overlap, so it freezes
+    // on an arbitrary phase; once a common signal appears, the frozen path
+    // must adopt its phase and the seam must be flat again.
+    const double theta = 2.0;
+    const auto rx = noise_then_common(60000, 200000, theta);
+    const double want = coherent_phase(theta);
+    for (const char* track : {"1", "0"}) {
+        scoped_env env("BONDED_TRACK", track);
+        overlap_reconstructor recon(edge_cfg());
+        (void)stream_through(recon, rx.first, rx.second, {8192});
+        BOOST_REQUIRE(recon.alignment().valid);
+        const double err = std::remainder(recon.alignment().phase_rad - want, 2 * kPi);
+        BOOST_TEST_MESSAGE("tracking " << track << ": phase error " << err * 180 / kPi << " deg");
+        if (track[0] == '1') {
+            BOOST_CHECK_LT(std::abs(err) * 180 / kPi, 1.0);
+        } else {
+            BOOST_CHECK_GT(std::abs(err) * 180 / kPi, 10.0); // the noise warmup was wrong
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_tracking_ignores_noise)
+{
+    // After a coherent warmup, a long stretch with only independent noise in
+    // each radio must not move the frozen phase.
+    const double theta = -1.0;
+    const auto rx = noise_then_common(400000, 60000, theta, /*noise_after=*/true);
+    const double want = coherent_phase(theta);
+    overlap_reconstructor recon(edge_cfg());
+    (void)stream_through(recon, rx.first, rx.second, {8192});
+    const double err = std::remainder(recon.alignment().phase_rad - want, 2 * kPi);
+    BOOST_TEST_MESSAGE("phase after noise " << err * 180 / kPi << " deg off");
+    BOOST_CHECK_LT(std::abs(err) * 180 / kPi, 1.0);
+}
+
+BOOST_AUTO_TEST_CASE(test_overlap_tracking_follows_the_strongest_signal)
+{
+    // Each radio has its own antenna, so the right phase differs per emitter.
+    // A weak continuous source (phase theta_w, seen during the warmup) and
+    // strong bursts (theta_s): the alignment must end up on the bursts, the
+    // signal that needs it.
+    const double T = 20e6, tw = -0.5, ts = 1.8;
+    const size_t n = 360000;
+    const std::vector<double> tones = {-8e6, -5e6, -1.5e6, -0.4e6, 0.4e6, 1.5e6, 5e6, 8e6};
+    std::vector<cf> shape(n, cf(0, 0));
+    for (size_t t = 0; t < tones.size(); t++) {
+        const auto x = bonded_test::tone(tones[t], T, n, 0.9 * static_cast<double>(t), 1.0);
+        for (size_t i = 0; i < n; i++) shape[i] += x[i];
+    }
+    auto burst_on = [](size_t i) { return i > 80000 && (i % 70000) < 8000; };
+    std::vector<cf> w1(n), w2(n);
+    using cd = std::complex<double>;
+    const cd rw(std::cos(tw), -std::sin(tw)), rs(std::cos(ts), -std::sin(ts));
+    for (size_t i = 0; i < n; i++) {
+        const cd base  = static_cast<cd>(shape[i]);
+        const double s = burst_on(i) ? 0.3 : 0.0;
+        w1[i] = static_cast<cf>(base * (0.01 + s));
+        w2[i] = static_cast<cf>(base * (0.01 * rw + s * rs));
+    }
+    // Radio 2's rotation is applied before its slice, like a channel.
+    const std::vector<cf> rx1 = make_slice(w1, T, -3.75e6, 5, 8);
+    const std::vector<cf> rx2 = make_slice(w2, T, +3.75e6, 5, 8);
+    overlap_reconstructor recon(edge_cfg());
+    (void)stream_through(recon, rx1, rx2, {8192});
+    const double want = coherent_phase(ts);
+    const double err  = std::remainder(recon.alignment().phase_rad - want, 2 * kPi);
+    BOOST_TEST_MESSAGE("strongest-signal tracking error " << err * 180 / kPi << " deg (weak source "
+                       << std::remainder(coherent_phase(tw) - want, 2 * kPi) * 180 / kPi
+                       << " deg away)");
+    BOOST_CHECK_LT(std::abs(err) * 180 / kPi, 3.0);
 }

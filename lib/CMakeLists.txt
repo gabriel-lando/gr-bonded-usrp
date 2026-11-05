@@ -4,11 +4,13 @@ list(APPEND bonded_usrp_sources
     overlap_reconstructor_impl.cc
     bonded_sink_impl.cc
     band_splitter_impl.cc
+    ofdm_splitter_impl.cc
     # DSP and device engine (public UHD API only)
     overlap_reconstructor.cpp
     bonded_receiver.cpp
     bonded_transmitter.cpp
-    band_splitter.cpp)
+    band_splitter.cpp
+    ofdm_splitter.cpp)
 
 set(bonded_usrp_sources
     "${bonded_usrp_sources}"
@@ -19,6 +21,7 @@ add_library(gnuradio-bonded_usrp SHARED ${bonded_usrp_sources})
 target_link_libraries(gnuradio-bonded_usrp
     PUBLIC
     gnuradio::gnuradio-runtime
+    gnuradio::gnuradio-fft
     ${UHD_LIBRARIES})
 
 target_include_directories(gnuradio-bonded_usrp

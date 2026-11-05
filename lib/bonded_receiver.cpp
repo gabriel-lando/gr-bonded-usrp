@@ -150,9 +150,20 @@ bonded_receiver::rx_result bonded_receiver::get_aligned_samples(
         _prof_calls.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Hold every ring while choosing the start time and extracting: a full
+    // ring loses its oldest chunk on every push, and if a front moved between
+    // the two steps, every fetch would start on a hole and fail for as long
+    // as the rings stay full.
+    const auto lock_start =
+        _rx_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(num_dev);
+    for (size_t d = 0; d < num_dev; d++) {
+        locks.emplace_back(_ring_mutexes[d]);
+    }
+
     double align_ts = -1.0;
     for (size_t d = 0; d < num_dev; d++) {
-        std::lock_guard<std::mutex> lock(_ring_mutexes[d]);
         if (_ring_buffers[d].empty()) {
             result.error_message = "Device " + std::to_string(d) + " has no data";
             return result;
@@ -165,10 +176,7 @@ bonded_receiver::rx_result bonded_receiver::get_aligned_samples(
         }
     }
 
-    const auto lock_start =
-        _rx_profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (size_t d = 0; d < num_dev; d++) {
-        std::lock_guard<std::mutex> lock(_ring_mutexes[d]);
         auto& ring = _ring_buffers[d];
 
         const auto extract = detail::extract_aligned_samples(
@@ -186,6 +194,7 @@ bonded_receiver::rx_result bonded_receiver::get_aligned_samples(
             degraded = true;
         }
     }
+    locks.clear();
     if (_rx_profile) {
         _prof_lock_ns.fetch_add(
             static_cast<size_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

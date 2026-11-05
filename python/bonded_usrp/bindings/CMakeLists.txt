@@ -5,6 +5,7 @@ list(APPEND bonded_usrp_python_files
     overlap_reconstructor_python.cc
     bonded_sink_python.cc
     band_splitter_python.cc
+    ofdm_splitter_python.cc
     python_bindings.cc)
 
 pybind11_add_module(bonded_usrp_python ${bonded_usrp_python_files})

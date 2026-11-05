@@ -26,6 +26,42 @@ using cf             = std::complex<float>;
 using cd             = std::complex<double>;
 
 // ---------------------------------------------------------------------------
+// Frequency translation
+// ---------------------------------------------------------------------------
+
+/// Oscillator whose phase is kept in double-precision cycles. A float phasor
+/// advanced by a float increment runs at the increment's rounded frequency,
+/// up to ~1e-8 cycles/sample off: two radios translated in opposite
+/// directions then drift apart by ~10 deg/s at 20 MS/s, which slowly detunes
+/// any frozen alignment between them. Callers rotate each block with the
+/// float increment() from an exact start phase at(k), then advance().
+struct nco
+{
+    double cycles_per_sample = 0.0;
+    double phase             = 0.0; // cycles, in [0, 1)
+
+    nco() = default;
+    nco(double freq_hz, double rate) : cycles_per_sample(freq_hz / rate) {}
+
+    static cf cis(double cycles)
+    {
+        const double a = 2.0 * kPi * (cycles - std::floor(cycles));
+        return cf(static_cast<float>(std::cos(a)), static_cast<float>(std::sin(a)));
+    }
+    cf increment() const { return cis(cycles_per_sample); }
+    //! Phasor k samples after the current position.
+    cf at(size_t k) const
+    {
+        return cis(phase + cycles_per_sample * static_cast<double>(k));
+    }
+    void advance(size_t n)
+    {
+        const double p = phase + cycles_per_sample * static_cast<double>(n);
+        phase          = p - std::floor(p);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Windowing
 // ---------------------------------------------------------------------------
 
