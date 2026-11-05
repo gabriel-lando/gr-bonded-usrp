@@ -1,6 +1,5 @@
 //
 // Copyright 2026 Gabriel Lando
-// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Subcarrier-domain TX split of CP-OFDM bursts. Per input symbol:
 //   1. FFT of the symbol body (the fft_len samples after its cyclic prefix);

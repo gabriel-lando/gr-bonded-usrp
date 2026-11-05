@@ -1,6 +1,5 @@
 //
 // Copyright 2026 Gabriel Lando
-// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Wideband band splitter, the TX counterpart of overlap_reconstructor.  The
 // combined baseband stream is, per radio:

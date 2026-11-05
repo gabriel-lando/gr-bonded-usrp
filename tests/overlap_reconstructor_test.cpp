@@ -1,6 +1,5 @@
 //
 // Copyright 2026 Gabriel Lando
-// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // End-to-end (no hardware) validation of the overlap-aware reconstruction.
 //

@@ -1,6 +1,5 @@
 //
 // Copyright 2026 Gabriel Lando
-// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Signal helpers shared by the unit tests.
 //

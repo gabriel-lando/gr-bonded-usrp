@@ -1,6 +1,5 @@
 //
 // Copyright 2026 Gabriel Lando
-// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Ring-buffer alignment used by bonded_receiver (no hardware): chunks are
 // placed on a common time grid by timestamp, holes stay holes, and the

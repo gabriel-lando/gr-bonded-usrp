@@ -1,6 +1,5 @@
 //
 // Copyright 2026 Gabriel Lando
-// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // No-hardware validation of the ofdm_splitter engine. Random CP-OFDM bursts
 // are split, each radio's output is put back on the wideband grid (ideal

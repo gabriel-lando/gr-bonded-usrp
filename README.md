@@ -392,7 +392,3 @@ On a Ryzen 7 5700G (8 cores), with the frequency plans above:
 | `python/bonded_usrp/` | Python bindings and flowgraph tests |
 | `grc/` | GRC block definitions |
 | `tests/` | C++ unit tests |
-
-## License
-
-GPL-3.0-or-later.

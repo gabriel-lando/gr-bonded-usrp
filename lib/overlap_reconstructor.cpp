@@ -1,6 +1,4 @@
 //
-// SPDX-License-Identifier: GPL-3.0-or-later
-//
 // Time-domain reconstruction: each radio is resampled (polyphase), translated
 // to the target baseband, and combined through complementary complex crossfade
 // FIR filters (which also discard the out-of-band corners).  Radio 2 is aligned

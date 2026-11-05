@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
 """Flowgraph tests of the band_splitter block (no hardware)."""
 
 import os

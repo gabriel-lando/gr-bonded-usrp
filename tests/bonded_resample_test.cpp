@@ -1,6 +1,5 @@
 //
 // Copyright 2026 Gabriel Lando
-// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Filter design, dot-product kernels and the streaming polyphase resamplers
 // shared by the reconstructor and the band splitter.
