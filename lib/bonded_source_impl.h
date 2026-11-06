@@ -42,7 +42,11 @@ private:
 
     std::vector<std::string> _serials;
     size_t _channels_per_device = 2;
+    double _rate = 0.0;
     double _fetch_timeout = 1.0;
+    // Device time the next block must start at to continue the last one.
+    bool _have_next_ts = false;
+    double _next_ts = 0.0;
 
     std::chrono::steady_clock::time_point _last_fetch_log{};
 

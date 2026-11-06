@@ -3,8 +3,10 @@
 #include "bonded_csv.hpp"
 #include "bonded_receiver.hpp"
 #include <gnuradio/io_signature.h>
+#include <pmt/pmt.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -103,6 +105,7 @@ bonded_source_impl::bonded_source_impl(const std::string& serials_csv,
                          static_cast<int>(_parse_serials(serials_csv).size() * 2),
                          sizeof(gr_complex))),
       _serials(_parse_serials(serials_csv)),
+      _rate(rate),
       _fetch_timeout(fetch_timeout)
 {
     bonded::bonded_receiver::config cfg;
@@ -143,6 +146,7 @@ bool bonded_source_impl::start()
     std::lock_guard<std::mutex> lock(_state_mutex);
     _rx->configure();
     _rx->start_continuous();
+    _have_next_ts = false;
     _running = true;
     return true;
 }
@@ -217,6 +221,24 @@ int bonded_source_impl::work(int noutput_items,
             }
             return 0;
         }
+
+        // Tag the first sample of the stream, and of every block that does
+        // not continue the previous one, with its device time (rx_time, as
+        // gr-uhd does). A dropped block is a gap in the radio timeline:
+        // downstream DSP must step over it, not close it up, or each radio's
+        // translation phase moves by a different amount.
+        const double ts = result.first_timestamps[0]; // common to all devices
+        if (!_have_next_ts || std::abs(ts - _next_ts) * _rate > 0.5) {
+            const double secs = std::floor(ts);
+            const pmt::pmt_t when = pmt::make_tuple(
+                pmt::from_uint64(static_cast<uint64_t>(secs)), pmt::from_double(ts - secs));
+            static const pmt::pmt_t rx_time = pmt::mp("rx_time");
+            for (size_t port = 0; port < output_items.size(); port++) {
+                add_item_tag(static_cast<unsigned>(port), nitems_written(port), rx_time, when);
+            }
+        }
+        _have_next_ts = true;
+        _next_ts      = ts + noutput_items / _rate;
 
         for (size_t d = 0; d < expected_devices; d++) {
             const size_t channels_available =

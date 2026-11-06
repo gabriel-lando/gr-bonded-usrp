@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <complex>
 #include <cstddef>
 #include <deque>
@@ -132,6 +133,41 @@ inline extract_result extract_aligned_samples(std::deque<ChunkT>& ring,
     }
 
     return result;
+}
+
+/*!
+ * Shift n samples, the first taken at device time t0, up by freq_hz, with the
+ * phase referenced to device time 0. A radio whose LO landed freq_hz above
+ * the requested frequency then delivers what an exactly tuned one would, and
+ * the correction stays continuous across any gap, since every chunk is
+ * anchored by its own timestamp.
+ */
+inline void correct_frequency(std::complex<float>* x,
+    const size_t n,
+    const double freq_hz,
+    const double t0,
+    const double rate)
+{
+    if (freq_hz == 0.0) {
+        return;
+    }
+    constexpr double kTwoPi = 6.283185307179586476925;
+    const double c0   = freq_hz * t0;
+    const double a0   = kTwoPi * (c0 - std::floor(c0));
+    const double step = kTwoPi * freq_hz / rate;
+    const std::complex<float> inc(
+        static_cast<float>(std::cos(step)), static_cast<float>(std::sin(step)));
+    // A float phasor drifts slowly; re-anchor it every block.
+    constexpr size_t kBlock = 1024;
+    for (size_t i = 0; i < n; i += kBlock) {
+        const double a = a0 + step * static_cast<double>(i);
+        std::complex<float> p(static_cast<float>(std::cos(a)), static_cast<float>(std::sin(a)));
+        const size_t end = std::min(n, i + kBlock);
+        for (size_t k = i; k < end; k++) {
+            x[k] *= p;
+            p *= inc;
+        }
+    }
 }
 
 }} // namespace bonded::detail

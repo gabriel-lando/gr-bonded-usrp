@@ -98,6 +98,9 @@ public:
     size_t num_channels() const { return num_devices() * _channels_per_device; }
     bool is_streaming() const { return _streaming; }
     bool is_configured() const { return _configured; }
+    //! Per device: where its LO landed minus the requested frequency (Hz).
+    //! The recv threads remove it from the samples.
+    const std::vector<double>& rf_errors() const { return _rf_error; }
 
 private:
     // Internal timestamped chunk for ring buffers
@@ -115,6 +118,7 @@ private:
 
     std::vector<uhd::usrp::multi_usrp::sptr> _devices;
     std::vector<uhd::rx_streamer::sptr> _streamers;
+    std::vector<double> _rf_error;
 
     // Continuous mode state
     std::vector<std::thread> _recv_threads;
@@ -130,6 +134,7 @@ private:
     std::vector<std::atomic<size_t>> _prof_served_samples;  // handed to the flowgraph
     std::vector<std::atomic<size_t>> _prof_dropped_samples; // silent ring trim
     std::vector<std::atomic<size_t>> _prof_ring_depth;      // samples resident
+    std::vector<std::atomic<size_t>> _prof_stall_ns;        // longest gap between recv() calls
     std::atomic<size_t> _prof_wait_ns{0};                   // consumer poll wait
     std::atomic<size_t> _prof_lock_ns{0};                   // ring mutex hold (extract)
     std::atomic<size_t> _prof_calls{0};

@@ -6,6 +6,7 @@ import sys
 import unittest
 
 import numpy as np
+import pmt
 from gnuradio import blocks, gr
 
 if os.environ.get("BONDED_USRP_PYTHON_DIR"):
@@ -15,10 +16,17 @@ else:
     from gnuradio import bonded_usrp
 
 
-def run_recon(rx1, rx2, rate_in, rate_out, target_bw, overlap, off):
+def rx_time_tag(offset, t):
+    secs = int(t)
+    return gr.tag_utils.python_to_tag(
+        (offset, pmt.intern("rx_time"),
+         pmt.make_tuple(pmt.from_uint64(secs), pmt.from_double(t - secs))))
+
+
+def run_recon(rx1, rx2, rate_in, rate_out, target_bw, overlap, off, tags=()):
     tb = gr.top_block()
-    s1 = blocks.vector_source_c(rx1.tolist(), False)
-    s2 = blocks.vector_source_c(rx2.tolist(), False)
+    s1 = blocks.vector_source_c(rx1.tolist(), False, 1, list(tags))
+    s2 = blocks.vector_source_c(rx2.tolist(), False, 1, list(tags))
     rec = bonded_usrp.overlap_reconstructor(rate_in, rate_out, target_bw, overlap, -off, off)
     snk = blocks.vector_sink_c()
     tb.connect(s1, (rec, 0))
@@ -84,6 +92,37 @@ class qa_overlap_reconstructor(unittest.TestCase):
             rx1, rx2 = self.slices(f, 400000, phase2=2.1, pilot=pilot, pilot_amp=1.0)
             out = run_recon(rx1, rx2, self.PR, self.T, self.T, self.O, self.OFF)
             self.assertAlmostEqual(self.amplitude(out[300000:-20000], f), 1.0, delta=0.03)
+
+    def test_rx_time_gap_is_stepped_over(self):
+        # bonded_source drops a block both radios have a hole in and tags
+        # the next sample with its rx_time. The reconstructor must continue
+        # the radios' timeline across the gap: closing it up would move each
+        # radio's translation phase differently and notch the overlap.
+        os.environ["BONDED_TRACK"] = "0"  # deterministic alignment
+        try:
+            n, at, gap = 450000, 150000, 131072  # gap after the warmup
+            k = np.arange(n)
+            # Content across the whole channel, overlap included.
+            rx1, rx2 = self.slices(0.4e6, n, phase2=1.3, pilot=-0.4e6, pilot_amp=1.0)
+            for f in (-7e6, 6e6):
+                a, b = self.slices(f, n, phase2=1.3, pilot=1e9)
+                rx1, rx2 = rx1 + a, rx2 + b
+            ref = run_recon(rx1, rx2, self.PR, self.T, self.T, self.O, self.OFF)
+            keep = np.r_[0:at, at + gap:n]
+            tags = [rx_time_tag(0, 5.0), rx_time_tag(at, 5.0 + (at + gap) / self.PR)]
+            out = run_recon(rx1[keep], rx2[keep], self.PR, self.T, self.T, self.O, self.OFF, tags)
+            closed = run_recon(rx1[keep], rx2[keep], self.PR, self.T, self.T, self.O, self.OFF)
+        finally:
+            del os.environ["BONDED_TRACK"]
+        shift = (gap // 5) * 8  # outputs of the skipped whole resampler periods
+        lo, hi = int(at * self.T / self.PR) + 8192, len(out) - 20000
+
+        def rel_err(x, s):
+            seg, r = x[lo:hi], ref[lo + s:hi + s]
+            return np.sum(np.abs(seg - r) ** 2) / np.sum(np.abs(r) ** 2)
+
+        self.assertLess(rel_err(out, shift), 1e-6)
+        self.assertGreater(min(rel_err(closed, s) for s in range(shift - 2, shift + 3)), 1e-2)
 
 
 if __name__ == "__main__":

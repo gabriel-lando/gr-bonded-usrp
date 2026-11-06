@@ -258,3 +258,33 @@ BOOST_AUTO_TEST_CASE(test_extract_aligned_samples_removed_accounting)
     BOOST_CHECK_GT(ok, 0u);
     BOOST_CHECK_GT(holes, 0u);
 }
+
+BOOST_AUTO_TEST_CASE(test_correct_frequency_is_continuous_across_gaps)
+{
+    // A radio whose LO landed e Hz high sees a signal at the requested
+    // frequency as a tone at -e. Corrected chunk by chunk from each chunk's
+    // own timestamp, it must come out as one constant phasor, also across
+    // gaps (an overflow) and chunk sizes that are not block multiples.
+    const double rate = 50e6, e = -0.834466457; // a real B210 LO error
+    const double t_start = 1234.5678;
+    const std::complex<double> c0(0.6, -0.3);
+    size_t pos = 0;
+    double max_err = 0.0;
+    for (size_t chunk : {2040u, 2040u, 1500u, 3000u, 2040u}) {
+        pos += (chunk == 3000u) ? 777777u : 0u; // a gap before this chunk
+        const double t0 = t_start + static_cast<double>(pos) / rate;
+        std::vector<std::complex<float>> x(chunk);
+        for (size_t i = 0; i < chunk; i++) {
+            const double t = t0 + static_cast<double>(i) / rate;
+            const double a = -2.0 * 3.141592653589793 * e * t;
+            x[i] = static_cast<std::complex<float>>(c0 * std::polar(1.0, a));
+        }
+        bonded::detail::correct_frequency(x.data(), chunk, e, t0, rate);
+        for (const auto& v : x) {
+            max_err = std::max(max_err, std::abs(static_cast<std::complex<double>>(v) - c0));
+        }
+        pos += chunk;
+    }
+    BOOST_TEST_MESSAGE("max deviation from the constant " << max_err);
+    BOOST_CHECK_LT(max_err, 1e-4); // float phasor rounding; a phase break would be ~1
+}

@@ -780,3 +780,60 @@ BOOST_AUTO_TEST_CASE(test_overlap_tracking_follows_the_strongest_signal)
                        << " deg away)");
     BOOST_CHECK_LT(std::abs(err) * 180 / kPi, 3.0);
 }
+
+BOOST_AUTO_TEST_CASE(test_overlap_skip_input_keeps_timeline)
+{
+    // A stretch both radios lost (a block dropped after an overflow) must be
+    // stepped over, not closed up: closing it up moves each radio's
+    // translation phase by a different amount, and with it the alignment.
+    // After the gap the output must match an uninterrupted run, shifted by
+    // the skipped outputs, once the filters' history has flushed.
+    scoped_env no_track("BONDED_TRACK", "0");
+    const double T = 20e6;
+    const std::vector<cf> wb = make_wideband(400000, T, {-8e6, -4e6, -1.2e6, 0.3e6, 1.4e6, 5e6, 8.5e6});
+    const std::vector<cf> rx1 = make_slice(wb, T, -3.75e6, 5, 8);
+    const std::vector<cf> rx2 = make_slice(wb, T, +3.75e6, 5, 8);
+    const size_t n = std::min(rx1.size(), rx2.size());
+    overlap_reconstructor ref_recon(edge_cfg());
+    const std::vector<cf> ref = stream_through(ref_recon, rx1, rx2, {8192});
+
+    auto feed = [&](overlap_reconstructor& r, size_t from, size_t to, std::vector<cf>& out) {
+        for (size_t i = from; i < to; i += 8192) {
+            const size_t sz = std::min<size_t>(8192, to - i);
+            const std::vector<cf> piece = r.process(&rx1[i], &rx2[i], sz);
+            out.insert(out.end(), piece.begin(), piece.end());
+        }
+    };
+    const size_t at = 60000; // input sample; the warmup is long over
+    for (size_t gap : {131072u, 130000u, 7u}) {
+        for (bool skip : {true, false}) {
+            overlap_reconstructor recon(edge_cfg());
+            std::vector<cf> out;
+            feed(recon, 0, at, out);
+            const size_t before = out.size();
+            if (skip) {
+                const std::vector<cf>& z = recon.skip_input(gap);
+                out.insert(out.end(), z.begin(), z.end());
+            }
+            feed(recon, at + gap, n, out);
+            // Outputs the skipped whole periods would have produced.
+            const size_t shift = skip ? (gap / 5) * 8 : ref.size() - out.size();
+            BOOST_REQUIRE_EQUAL(out.size() + shift, ref.size());
+            double err = 0.0, energy = 0.0;
+            for (size_t i = before + 4096; i < out.size(); i++) {
+                err += std::norm(out[i] - ref[i + shift]);
+                energy += std::norm(ref[i + shift]);
+            }
+            BOOST_TEST_MESSAGE("gap " << gap << (skip ? " skipped" : " closed up")
+                                      << ": rel err after the gap " << err / energy);
+            if (skip) {
+                BOOST_CHECK_LT(err / energy, 1e-6);
+            } else if (gap % 5 != 0) {
+                // Closed up, a gap of whole resampler periods only rotates
+                // both radios alike in this plan (offsets of 3/16 T); any
+                // other gap moves their output grid and relative phase.
+                BOOST_CHECK_GT(err / energy, 1e-2);
+            }
+        }
+    }
+}

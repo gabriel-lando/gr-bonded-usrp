@@ -61,6 +61,9 @@ ctest --output-on-failure
 sudo make install && sudo ldconfig
 ```
 
+The build type defaults to Release: without it only the reconstructor was
+optimized, and the receive threads overflowed continuously at 2 × 50 MS/s
+on a host configured with a plain `cmake ..`.
 `overlap_reconstructor.cpp` is built with `-O3 -ffast-math -funroll-loops
 -march=native`. Bit-exact comparisons between differently vectorized loops
 can therefore differ by an ULP; compare with a relative tolerance. Reinstall
@@ -154,6 +157,28 @@ after changing any header used by the bindings, or Python crashes with
   radio for the rest of the session.
 - **RX ring bookkeeping is O(1)** (`extract_result::removed`). Rescanning the
   deque under its mutex at tens of MS/s causes a feedback spiral.
+- **A dropped block is a gap, not a splice.** The reconstructor's NCOs run on
+  its output sample count, so processing the block after a dropped one as if
+  it were contiguous moves each radio's translation phase by a different
+  amount (the alignment jumped at every overflow). `bonded_source` tags the
+  first sample of the stream and of every block that does not continue the
+  previous one with `rx_time`; `overlap_reconstructor` measures the gap from
+  the tags and calls `skip_input()`, which advances both NCOs by the skipped
+  whole resampler periods (decim inputs → interp outputs, polyphase phase
+  unchanged) and feeds the remainder as zeros.
+  `test_overlap_skip_input_keeps_timeline` and the `qa_overlap_reconstructor`
+  gap test guard it. (In the 12/64 plans a gap of whole periods closed up only
+  rotates both radios alike; any other gap breaks the alignment.)
+- **RX tunes the RF only.** UHD's default tune trims the synthesizer's
+  rounding with the FPGA NCO, which rounds to 0.012 Hz at 50 MS/s (two radios
+  0.007 Hz apart: 2.5 °/s of relative drift) and restarts its phase when UHD
+  restarts a stream after an overflow (a single-channel B210 overflow flushes
+  the host buffers and reissues START_CONTINUOUS). Both were measured on raw
+  recordings with forced overflows (pure phase jumps, delay unchanged). The
+  tune uses `dsp_freq = 0`, and the recv threads remove the synthesizer's
+  error (exact, from the tune result) with `detail::correct_frequency()`,
+  whose phase comes from each chunk's device timestamp, so it is continuous
+  across gaps.
 - **A full ring must not stall the source.** Once the flowgraph falls 4 s
   behind, every push drops the oldest chunk of that ring. Choosing the start
   time and extracting therefore happen under *all* ring locks (otherwise a
@@ -194,13 +219,22 @@ after changing any header used by the bindings, or Python crashes with
 - Things measured and found *not* to matter: the output memcpy
   (`BONDED_DIRECT_OUT`), CPU pinning/SMT placement, and the ring mutex hold
   time.
-- Two B210s on one USB 3 controller deliver 45–50 MS/s each without overflow.
-  At high bandwidths the limit is the host DSP and the flowgraph, not the
-  radios.
+- Two B210s on one USB 3 controller deliver 50 MS/s each (UHD's
+  `benchmark_rate`, no overflow). With the full receiver there are still
+  0.1–0.5 overflows per second at 2 × 50 MS/s, with or without a signal, in
+  record mode too, and the `stall` profile column shows the receive threads
+  never wait more than ~0.5 ms (UHD buffers ~20 ms). Each costs one dropped
+  block plus what UHD flushes, 3–4 ms; harmless now that gaps are stepped
+  over. Real-time priority for the UHD threads (an `rtprio` limit, e.g. the
+  `usrp` group) reduces them somewhat; it is a host setting, not code.
 - Check the CPU governor (`performance`) before any benchmark.
 
 ## 8. Known open points
 
+- **Above 60 MHz the 802.11 receiver needs a faster front-end.** With a
+  gr-ieee802-11 that has `sync_short_fused` (the Schmidl-Cox chain folded
+  into sync_short; not upstream) 80 MHz decodes in real time; with stock
+  gr-ieee802-11 the following applies.
 - **60 MHz decode on an 8-core host with stock gr-ieee802-11 is marginal.**
   Reconstruction alone has margin, but the stock PHY plus the two receive
   threads (each near a full core at 37.5 MS/s) and the reconstructor's

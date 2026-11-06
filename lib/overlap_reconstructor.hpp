@@ -97,6 +97,17 @@ public:
         std::complex<float>* dst,
         size_t cap);
 
+    /*!
+     * The inputs jump n samples ahead (both radios lost the same stretch,
+     * e.g. a block dropped after an overflow). Continues the timeline as if
+     * those samples had been received, so each radio's translation phase,
+     * and with it the alignment, stays right. Whole resampler periods are
+     * skipped without computing; the remainder (fewer than one period) goes
+     * through as zeros, and its output is returned (valid until the next
+     * call).
+     */
+    const std::vector<std::complex<float>>& skip_input(size_t n);
+
     //! Output samples from the last process_into() that did not fit in `dst`.
     const std::vector<std::complex<float>>& pending() const;
 

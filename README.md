@@ -41,7 +41,17 @@ example an 802.11 OFDM receiver.
 
 `bonded_source` streams both radios and aligns their samples by device
 timestamp. If one radio drops samples (overflow), the block is dropped on
-**both** radios, so they never slip against each other.
+**both** radios, so they never slip against each other, and the next block
+carries an `rx_time` tag. `overlap_reconstructor` steps over the gap there
+instead of closing it up, so each radio's frequency shift, and with it the
+alignment, continues on the radios' time.
+
+The radios are tuned with the synthesizer only, without UHD's usual FPGA
+frequency trim. That trim rounds to 0.01 Hz, which makes two radios drift
+apart by a few degrees per second, and its phase restarts whenever UHD
+restarts a stream after an overflow. The synthesizer lands a fraction of a
+hertz off the requested frequency, by an amount UHD reports exactly;
+`bonded_source` removes it from the samples, referenced to device time.
 
 Frequency plan without wasted spectrum, for a channel of width `T` with
 overlap `O`:
@@ -111,7 +121,10 @@ radio's band, where its DUC rolls off.
 
 Drive level: the radios' DACs clip at full scale (|x| = 1) and OFDM has a high
 peak-to-average ratio. Keep each radio's RMS around 0.3 or below and use the
-TX gain for power; clipping shows up first as 64-QAM losses.
+TX gain for power; clipping shows up first as 64-QAM losses. A wider channel
+spreads the same power over more bandwidth, so dense constellations need more
+TX gain at 60–80 MHz than at 20 MHz, where the same gain can saturate a nearby
+receiver.
 
 ## Blocks
 
@@ -140,7 +153,16 @@ bonded_usrp.bonded_source(serials_csv, rate, freq, gain,
 | `stream_args` | extra UHD RX stream args |
 
 Outputs: two ports per radio (port `2*d + ch` = radio `d`, channel `ch`). Use
-ports 0 and 2 for `overlap_reconstructor`.
+ports 0 and 2 for `overlap_reconstructor`. The first sample, and the first
+sample after every dropped block, carry an `rx_time` tag (device time, as
+gr-uhd's `usrp_source` sets it).
+
+At start-up each radio prints how far its LO landed from the requested
+frequency; that offset is already removed from the output:
+
+```text
+[bonded_receiver] Device 0: 50.000 Msps, 2469.000 MHz (LO +0.357628 Hz off, corrected), 1 ch
+```
 
 ### `overlap_reconstructor` (RX)
 
@@ -152,7 +174,9 @@ bonded_usrp.overlap_reconstructor(rate_in, rate_out, target_bw, overlap_bw,
 Inputs: radio A, radio B (at `rate_in`). Output: the channel at `rate_out`.
 `radio1_offset` and `radio2_offset` are each radio's centre minus `fc` and must
 match the tuning. For the plan above: `(12.5e6, 20e6, 20e6, 5e6, -3.75e6,
-3.75e6)`.
+3.75e6)`. The block reads `rx_time` tags on its first input: when one shows a
+jump in the radios' time (a block `bonded_source` dropped), it continues the
+timeline across the gap.
 
 ### `band_splitter` (TX)
 
@@ -280,7 +304,7 @@ The engine uses only the public UHD API. UHD itself is not modified.
 git clone https://github.com/gabriel-lando/gr-bonded-usrp.git
 cd gr-bonded-usrp
 mkdir build && cd build
-cmake ..                      # -DCMAKE_INSTALL_PREFIX=... to install elsewhere
+cmake ..                      # Release unless -DCMAKE_BUILD_TYPE says otherwise
 make -j$(nproc)
 ctest --output-on-failure     # hardware-free tests
 sudo make install
@@ -304,14 +328,14 @@ Python flowgraphs again: a stale binding usually crashes with
 
 | test | covers |
 |---|---|
-| `overlap_reconstructor_test` | gain and phase recovery, band flatness including the seam, both frequency plans, warmup and frozen paths (and that the frozen path continues the warmup timeline), phase tracking after a noise-only warmup and its immunity to noise, no phase drift over a long run, streaming, thread count invariance, direct-output API, config checks |
+| `overlap_reconstructor_test` | gain and phase recovery, band flatness including the seam, both frequency plans, warmup and frozen paths (and that the frozen path continues the warmup timeline), phase tracking after a noise-only warmup and its immunity to noise, no phase drift over a long run, stepping over a gap in the input timeline, streaming, thread count invariance, direct-output API, config checks |
 | `bonded_resample_test` | filter design, dot-product kernels, streaming polyphase resamplers, sliced computation, oscillator phase over long runs |
-| `bonded_receiver_test` | timestamp alignment of the receive rings: stale data, holes after an overflow, multi-channel, two-device alignment, bookkeeping |
+| `bonded_receiver_test` | timestamp alignment of the receive rings: stale data, holes after an overflow, multi-channel, two-device alignment, bookkeeping; LO error correction continuous across gaps |
 | `bonded_transmitter_test` | configuration checks, phase-offset API, frequency/phase correction across chunks |
 | `band_splitter_test` | flatness, half assignment, seam width, pulled-in plan, streaming vs one-shot, output length, no phase drift, config checks |
 | `ofdm_splitter_test` | every subcarrier recovered at any relative phase of the radios (both plans), subcarrier assignment, radio-rate timeline and burst release, chunked vs one-call streaming, config checks |
 | `bonded_csv_test` | parsing of the comma-separated block parameters |
-| `qa_band_splitter`, `qa_ofdm_splitter`, `qa_overlap_reconstructor` | the GNU Radio blocks in flowgraphs (Python) |
+| `qa_band_splitter`, `qa_ofdm_splitter`, `qa_overlap_reconstructor` | the GNU Radio blocks in flowgraphs (Python), including an `rx_time` gap through the reconstructor |
 
 Device setup, streaming and the over-the-air behaviour require radios and are
 not covered by `ctest`.
@@ -336,7 +360,7 @@ The two profile lines:
 
 ```text
 [bonded_profile]    recon calls=N parallel_calls=N avg_ms=X in_msps=X out_msps=X stage_pct={...}
-[bonded_rx_profile] calls=N wait=X% ringlock=X% | dev0 recv=X served=X dropped=X ring=Xms | dev1 ...
+[bonded_rx_profile] calls=N wait=X% ringlock=X% | dev0 recv=X served=X dropped=X ring=Xms stall=Xus | dev1 ...
 ```
 
 To diagnose a throughput problem:
@@ -345,6 +369,9 @@ To diagnose a throughput problem:
 - `recv` at the rate but `served` below it means the flowgraph is behind. A
   growing `ring` is the early warning; drops start once it reaches 4 s.
 - A high `wait` with `ring` near zero is healthy.
+- `stall` is the longest gap between two `recv()` calls of a radio's receive
+  thread in that second. UHD buffers about 20 ms, so overflows with `stall`
+  well below that are not the receive thread falling behind.
 - For the reconstructor, duty cycle = `calls × avg_ms / 1000`. Near 100 % means
   it is compute-bound. Well below 100 % while `in_msps` is under the per-radio
   rate means it is starved by the source.
@@ -362,6 +389,13 @@ A coherence near 1 means the warmup saw a signal common to both radios; near
 0 means it saw only noise, and the first frames through the overlap will
 correct the phase.
 
+After overflows it also reports, at most once per second, the gaps in the
+radios' timeline it stepped over:
+
+```text
+[overlap_reconstructor] stepped over N gap(s) in the radio timeline, M samples
+```
+
 Set the CPU frequency governor to `performance` for high bandwidths.
 
 ## Measured capacity
@@ -370,10 +404,10 @@ On a Ryzen 7 5700G (8 cores), with the frequency plans above:
 
 | | bandwidth |
 |---|---|
-| RX, reconstruction only | 80 MHz real time (64 MHz with margin) |
-| RX with a GNU Radio 802.11 receiver attached | 40 MHz decoding at parity with a single-radio receiver |
-| TX, bonded, 802.11 frames | 20, 40 and 60 MHz without underruns |
-| 64-QAM 3/4 through a bonded TX and a bonded RX (`ofdm_splitter`) | 97–100 % of the frames at 20 and 40 MHz; ~85 % at 60 MHz, where the same TX power is spread over three times the bandwidth |
+| RX, reconstruction only | 80 MHz real time |
+| RX with a GNU Radio 802.11 receiver attached | 40 MHz with stock gr-ieee802-11; 80 MHz real time with a fused Schmidl-Cox front-end (`sync_short_fused`, a gr-ieee802-11 patch) |
+| TX, bonded, 802.11 frames | 20 to 80 MHz without underruns |
+| 64-QAM 3/4 through a bonded TX and a bonded RX (`ofdm_splitter`), both directions between two hosts | 97–100 % of the frames in typical sessions at 20 to 80 MHz (TX amplitude 0.3; TX gain one step higher from 40 MHz up, since the same power is spread over a wider channel), also at 20 frames/s at 80 MHz |
 
 ## Source layout
 

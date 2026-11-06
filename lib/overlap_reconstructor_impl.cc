@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -70,8 +71,57 @@ bool overlap_reconstructor_impl::start()
 {
     _recon->reset();
     _leftover.clear();
-    _lead = 0;
+    _lead      = 0;
+    _have_time = false;
+    _since_tag = 0;
+    _tag_done  = ~uint64_t(0);
     return true;
+}
+
+int overlap_reconstructor_impl::_handle_rx_time(const gr::tag_t& tag,
+    gr_complex* out,
+    int room)
+{
+    _tag_done = tag.offset;
+    if (!pmt::is_tuple(tag.value) || pmt::length(tag.value) != 2) {
+        return 0;
+    }
+    const double t = static_cast<double>(pmt::to_uint64(pmt::tuple_ref(tag.value, 0)))
+                     + pmt::to_double(pmt::tuple_ref(tag.value, 1));
+    int produced = 0;
+    if (_have_time) {
+        const long long gap = std::llround((t - _tag_time) * _rate_in)
+                              - static_cast<long long>(_since_tag);
+        if (gap > 0) {
+            _skipped_unlogged += static_cast<uint64_t>(gap);
+            _gaps_unlogged++;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - _last_gap_log >= std::chrono::seconds(1)) {
+                std::cerr << "[overlap_reconstructor] stepped over " << _gaps_unlogged
+                          << " gap(s) in the radio timeline, " << _skipped_unlogged
+                          << " samples" << std::endl;
+                _skipped_unlogged = 0;
+                _gaps_unlogged    = 0;
+                _last_gap_log     = now;
+            }
+            const std::vector<gr_complex>& z =
+                _recon->skip_input(static_cast<size_t>(gap));
+            const size_t take = std::min(z.size(), static_cast<size_t>(room));
+            std::memcpy(out, z.data(), take * sizeof(gr_complex));
+            produced = static_cast<int>(take);
+            if (take < z.size()) {
+                _leftover.assign(z.begin() + take, z.end());
+                _lead = 0;
+            }
+        } else if (gap < 0) {
+            std::cerr << "[overlap_reconstructor] rx_time went back " << -gap
+                      << " samples; ignored" << std::endl;
+        }
+    }
+    _have_time = true;
+    _tag_time  = t;
+    _since_tag = 0;
+    return produced;
 }
 
 void overlap_reconstructor_impl::forecast(int noutput_items,
@@ -116,8 +166,30 @@ int overlap_reconstructor_impl::general_work(int noutput_items,
     //    _leftover and make this block and the one downstream run in series.
     int consumed = 0;
     if (produced < noutput_items && _leftover.empty()) {
-        const int navail = std::min(ninput_items[0], ninput_items[1]);
-        if (navail > 0) {
+        int navail = std::min(ninput_items[0], ninput_items[1]);
+
+        // bonded_source tags the first sample after a gap in the radio
+        // timeline (a block dropped after an overflow) with rx_time. Step
+        // over the gap there, so the translation phases follow the radios'
+        // time; process input only up to the next such tag.
+        static const pmt::pmt_t rx_time = pmt::mp("rx_time");
+        const uint64_t nread = nitems_read(0);
+        std::vector<gr::tag_t> tags;
+        get_tags_in_range(tags, 0, nread, nread + static_cast<uint64_t>(std::max(navail, 0)), rx_time);
+        std::sort(tags.begin(), tags.end(), gr::tag_t::offset_compare);
+        for (const gr::tag_t& tag : tags) {
+            if (tag.offset == _tag_done) {
+                continue;
+            }
+            if (tag.offset == nread) {
+                produced += _handle_rx_time(tag, out + produced, noutput_items - produced);
+                continue;
+            }
+            navail = static_cast<int>(tag.offset - nread);
+            break;
+        }
+
+        if (navail > 0 && produced < noutput_items && _leftover.empty()) {
             const size_t room = static_cast<size_t>(noutput_items - produced);
             const int want =
                 static_cast<int>(std::ceil(room * _rate_in / _rate_out));
@@ -145,6 +217,7 @@ int overlap_reconstructor_impl::general_work(int noutput_items,
         }
     }
     consume_each(consumed);
+    _since_tag += static_cast<uint64_t>(consumed);
     return produced;
 }
 

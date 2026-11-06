@@ -66,6 +66,7 @@ void bonded_receiver::start_continuous()
     _prof_served_samples  = std::vector<std::atomic<size_t>>(num_dev);
     _prof_dropped_samples = std::vector<std::atomic<size_t>>(num_dev);
     _prof_ring_depth      = std::vector<std::atomic<size_t>>(num_dev);
+    _prof_stall_ns        = std::vector<std::atomic<size_t>>(num_dev);
     _prof_last_log        = std::chrono::steady_clock::now();
     _ring_available_samples.assign(num_dev, 0);
 
@@ -329,6 +330,7 @@ void bonded_receiver::_configure_hardware()
             "bonded_receiver: freq_plan size must match number of devices");
     }
 
+    _rf_error.assign(_devices.size(), 0.0);
     for (size_t d = 0; d < _devices.size(); d++) {
         auto& usrp = _devices[d];
         if (!_config.subdev.empty()) {
@@ -337,14 +339,31 @@ void bonded_receiver::_configure_hardware()
         usrp->set_rx_rate(_config.rate);
         const double dev_freq = use_freq_plan ? _config.freq_plan[d] : _config.freq;
         const size_t nch = usrp->get_rx_num_channels();
+        // Tune the RF only, with no FPGA (DSP) shift. UHD's default trims
+        // the synthesizer's rounding with the FPGA NCO, which itself rounds
+        // (0.01 Hz at 50 MHz: the two radios drift apart by degrees per
+        // second) and restarts its phase whenever the stream restarts after
+        // an overflow (a jump of the relative phase at every overflow). The
+        // synthesizer's error is exact and constant; the recv threads take it
+        // out of the samples instead.
+        uhd::tune_request_t tune(dev_freq);
+        tune.rf_freq_policy  = uhd::tune_request_t::POLICY_MANUAL;
+        tune.rf_freq         = dev_freq;
+        tune.dsp_freq_policy = uhd::tune_request_t::POLICY_MANUAL;
+        tune.dsp_freq        = 0.0;
+        double rf_error = 0.0;
         for (size_t ch = 0; ch < nch; ch++) {
-            usrp->set_rx_freq(uhd::tune_request_t(dev_freq), ch);
+            const uhd::tune_result_t r = usrp->set_rx_freq(tune, ch);
+            if (ch == 0) {
+                rf_error = r.actual_rf_freq - dev_freq;
+            }
             usrp->set_rx_gain(_config.gain, ch);
         }
+        _rf_error[d] = rf_error;
         std::cout << boost::format(
-                         "[bonded_receiver] Device %u: %.3f Msps, %.3f MHz, %u ch%s\n")
-                         % d % (usrp->get_rx_rate() / 1e6)
-                         % (usrp->get_rx_freq(0) / 1e6) % nch
+                         "[bonded_receiver] Device %u: %.3f Msps, %.3f MHz (LO %+.6f Hz off, "
+                         "corrected), %u ch%s\n")
+                         % d % (usrp->get_rx_rate() / 1e6) % (dev_freq / 1e6) % rf_error % nch
                          % (use_freq_plan ? " (freq_plan)" : "");
 
         if (d == 0) {
@@ -434,8 +453,19 @@ void bonded_receiver::_recv_loop(size_t d)
     uhd::rx_metadata_t md;
     size_t pending_overflow_logs = 0;
     auto last_overflow_log = std::chrono::steady_clock::now();
+    auto handled = std::chrono::steady_clock::now();
     while (!_stop_flag) {
+        if (_rx_profile) {
+            // Time between recv() calls: the radio's FIFO fills meanwhile.
+            const size_t gap = static_cast<size_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - handled).count());
+            if (gap > _prof_stall_ns[d].load(std::memory_order_relaxed)) {
+                _prof_stall_ns[d].store(gap, std::memory_order_relaxed);
+            }
+        }
         const size_t n = streamer->recv(ptrs, buf_sz, md, 0.1);
+        handled = std::chrono::steady_clock::now();
 
         // An overflow is reported on a recv() that returns no samples, so
         // check the metadata before skipping empty returns.
@@ -459,6 +489,10 @@ void bonded_receiver::_recv_loop(size_t d)
         if (n == 0) continue;
         if (_rx_profile) {
             _prof_recv_samples[d].fetch_add(n, std::memory_order_relaxed);
+        }
+        for (size_t ch = 0; ch < nch; ch++) {
+            detail::correct_frequency(
+                bufs[ch].data(), n, _rf_error[d], md.time_spec.get_real_secs(), _config.rate);
         }
 
         // Build chunk and push to ring buffer
@@ -528,8 +562,11 @@ void bonded_receiver::_maybe_log_rx_profile()
             _prof_dropped_samples[d].exchange(0, std::memory_order_relaxed) / el / 1e6;
         const double ring_ms =
             1e3 * _prof_ring_depth[d].load(std::memory_order_relaxed) / _config.rate;
-        ss << boost::format(" | dev%u recv=%.2f served=%.2f dropped=%.2f ring=%.0fms")
-                  % d % recv_msps % served_msps % dropped_msps % ring_ms;
+        const double stall_us =
+            _prof_stall_ns[d].exchange(0, std::memory_order_relaxed) / 1e3;
+        ss << boost::format(
+                  " | dev%u recv=%.2f served=%.2f dropped=%.2f ring=%.0fms stall=%.0fus")
+                  % d % recv_msps % served_msps % dropped_msps % ring_ms % stall_us;
     }
     std::cerr << ss.str() << "\n";
 }

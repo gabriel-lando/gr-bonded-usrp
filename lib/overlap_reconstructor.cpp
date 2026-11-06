@@ -232,7 +232,7 @@ struct overlap_reconstructor::impl
     clock::time_point last_track_log{};
 
     // Reusable scratch buffers (retain capacity across calls).
-    std::vector<cf> r1_, r2_, o1_, o2_, out_;
+    std::vector<cf> r1_, r2_, o1_, o2_, out_, zeros_;
     // Warmup crossfade history buffers ([tail | rotated block]) and the K-1
     // sample tails carried across calls.
     std::vector<cf> ch1_, ch2_, tail1_, tail2_;
@@ -583,6 +583,26 @@ struct overlap_reconstructor::impl
 #endif
     }
 
+    //! See overlap_reconstructor::skip_input(). decim inputs make exactly
+    //! interp outputs and leave every polyphase phase where it was, so whole
+    //! periods only move the translation; the history the filters keep from
+    //! before the gap costs a transient of one filter length.
+    const std::vector<cf>& skip(size_t n)
+    {
+        const size_t rem = n % decim;
+        if (rem > 0) {
+            zeros_.assign(rem, cf(0, 0));
+            process(zeros_.data(), zeros_.data(), rem);
+        } else {
+            out_.clear();
+            direct_written_ = 0;
+        }
+        const size_t periods = n / decim;
+        nco1.advance(periods * interp);
+        nco2.advance(periods * interp);
+        return out_;
+    }
+
     const std::vector<cf>& process(const cf* rx1, const cf* rx2, size_t n)
     {
         const auto total_start = profile_enabled ? clock::now() : clock::time_point{};
@@ -812,6 +832,16 @@ size_t overlap_reconstructor::process_into(const std::complex<float>* rx1,
     _impl->direct_cap_ = 0;
     _alignment = _impl->align;
     return _impl->direct_written_;
+}
+
+const std::vector<std::complex<float>>& overlap_reconstructor::skip_input(size_t n)
+{
+    if (!_impl) {
+        _impl = std::make_shared<impl>(_cfg);
+    }
+    const auto& out = _impl->skip(n);
+    _alignment = _impl->align;
+    return out;
 }
 
 const std::vector<std::complex<float>>& overlap_reconstructor::pending() const
